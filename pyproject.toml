@@ -1,0 +1,44 @@
+[project]
+name = "env-pipeline"
+version = "0.1.0"
+description = "선박 특화 LLM — 환경 데이터 수집/적재 파이프라인"
+requires-python = ">=3.12"
+
+dependencies = [
+    # ECMWF CDS API 클라이언트 (ERA5 재분석 데이터 다운로드)
+    "cdsapi>=0.7.0",
+    # ECMWF 예보 데이터 다운로드 (Open Data, CDS API와 별개 라이브러리)
+    # 사용처: src/env_pipeline/ecmwf/ecmwf_forecast_downloader.py
+    # PyPI 최신 버전: 0.3.x (1.x는 존재하지 않음)
+    "ecmwf-opendata>=0.3.0",
+    # GRIB2 파일 읽기 (ECMWF 예보 파일 형식 변환용)
+    # ecmwf-opendata가 GRIB2를 다운로드하면, cfgrib로 xarray Dataset으로 변환
+    "cfgrib>=0.9.10",
+    # cfgrib의 핵심 의존성 (GRIB2 포맷 처리 엔진)
+    "eccodes>=1.6.0",
+    # NetCDF 파일 처리 (ERA5 다운로드 파일 형식)
+    "xarray>=2024.0.0",
+    "netCDF4>=1.6.0",
+    # 수치 연산 및 데이터 처리
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    # PostgreSQL 연결 드라이버
+    "psycopg2-binary>=2.9.0",
+    # .env 파일에서 환경변수 로드
+    "python-dotenv>=1.0.0",
+    # 로그 출력 (loguru는 기본 logging보다 사용하기 편함)
+    "loguru>=0.7.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/env_pipeline"]
+
+[tool.uv]
+# UV 의존성 해결 범위를 실제 실행 환경(Linux/WSL)으로 제한
+# 이유: ecmwf-opendata 1.3.0+이 Windows ARM64 Python 3.14에 미제공
+#       → 제한 없으면 "No solution found" 오류 발생
+environments = ["sys_platform == 'linux'"]

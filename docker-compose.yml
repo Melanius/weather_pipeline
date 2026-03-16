@@ -1,0 +1,43 @@
+version: '3.8'
+
+# Docker Compose: TimescaleDB(PostgreSQL 확장) 로컬 실행 설정
+# 실행 명령: docker-compose up -d
+# 종료 명령: docker-compose down
+# 데이터 삭제 포함 종료: docker-compose down -v
+
+services:
+  timescaledb:
+    # TimescaleDB 공식 이미지 (PostgreSQL 16 기반)
+    image: timescale/timescaledb:latest-pg16
+    container_name: llm_ship_timescaledb
+
+    # 컨테이너가 종료되면 자동 재시작
+    restart: unless-stopped
+
+    # PostgreSQL 초기 설정값 (환경변수로 전달)
+    environment:
+      POSTGRES_USER: ${DB_USER:-shipllm}         # DB 사용자명 (.env 없으면 기본값 사용)
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-shipllm1234}  # DB 비밀번호
+      POSTGRES_DB: ${DB_NAME:-ship_env}           # 생성할 DB 이름
+
+    # 포트 매핑: 호스트:컨테이너
+    # 로컬에서 localhost:5432 로 접속 가능
+    ports:
+      - "${DB_PORT:-5432}:5432"
+
+    # 데이터 영속성: Docker 볼륨에 DB 데이터 저장
+    # 컨테이너를 삭제해도 데이터는 볼륨에 남아있음
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+
+    # PostgreSQL 성능 튜닝 파라미터
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c work_mem=64MB
+      -c max_connections=100
+
+# 볼륨 정의: timescaledb_data 라는 이름으로 Docker가 관리
+volumes:
+  timescaledb_data:
+    name: llm_ship_timescaledb_data

@@ -1,0 +1,23 @@
+{
+    "year": {
+        "start": 2024,
+        "end": 2024,
+        "step": 1
+    },
+    "month": {
+        "start": 10,
+        "end": 10,
+        "step": 1
+    },
+    "day": {
+        "start": 23,
+        "end": 23,
+        "step": 1
+    },
+    "hour": {
+        "start": 3,
+        "end": 3,
+        "step": 3
+    },
+    "type": "wave"
+}

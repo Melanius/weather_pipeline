@@ -1,0 +1,26 @@
+# API 키, DB 비밀번호 등 민감 정보 — 절대 Git에 올리면 안 됨
+.env
+
+# Python 캐시 파일
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# UV 가상환경 폴더
+.venv/
+
+# 다운로드된 데이터 파일 (용량이 크므로 Git 제외)
+data/
+
+# 로그 파일
+logs/
+
+# Jupyter 체크포인트
+.ipynb_checkpoints/
+
+# VS Code 설정
+.vscode/
+
+# macOS
+.DS_Store

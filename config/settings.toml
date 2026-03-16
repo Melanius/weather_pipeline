@@ -1,0 +1,101 @@
+# =============================================
+# 환경 데이터 파이프라인 설정 파일
+# 코드를 수정하지 않고 이 파일만 수정해서 동작 변경 가능
+# =============================================
+
+[ecmwf]
+# CDS API 데이터셋 이름 (ERA5 단일 레벨 대기/해양 변수)
+dataset = "reanalysis-era5-single-levels"
+
+# 데이터 타입: "reanalysis" = 과거 재분석 데이터
+product_type = "reanalysis"
+
+# 다운로드 파일 형식 (NetCDF = 기상/해양 데이터 표준 포맷)
+data_format = "netcdf"
+
+# 공간 해상도 (단위: 도)
+# 0.25 = ERA5 원본 해상도 (전세계 721×1440 격자점)
+# 0.5  = 절반 해상도 (361×720, 용량 1/4)
+# 1.0  = 1도 해상도 (181×360, 용량 1/16) — 빠른 테스트용
+spatial_resolution = 0.25
+
+[ecmwf.variables]
+# 수집할 파랑(Wave) 변수 목록
+# 변수명은 CDS API에서 사용하는 공식 명칭
+wave = [
+    "significant_height_of_combined_wind_waves_and_swell",  # swh: 복합 유의파고 (m)
+    "mean_wave_direction",                                   # mwd: 평균 파랑 방향 (도)
+    "mean_wave_period",                                      # mwp: 평균 파랑 주기 (초)
+    "significant_height_of_total_swell",                     # shts: 너울 유의파고 (m)
+    "mean_direction_of_total_swell",                         # mdts: 너울 방향 (도)
+    "mean_period_of_total_swell",                            # mpts: 너울 주기 (초)
+    "significant_height_of_wind_waves",                      # shww: 풍파 유의파고 (m)
+    "mean_direction_of_wind_waves",                          # mdww: 풍파 방향 (도)
+    "mean_period_of_wind_waves",                             # mpww: 풍파 주기 (초)
+]
+
+# 수집할 바람(Wind) 변수 목록
+wind = [
+    "10m_u_component_of_wind",   # u10: 10m 고도 동서 방향 풍속 (m/s, 동쪽+)
+    "10m_v_component_of_wind",   # v10: 10m 고도 남북 방향 풍속 (m/s, 북쪽+)
+]
+
+# ※ 날짜 범위는 config/down.json 에서 설정 (start_date, end_date)
+
+[database]
+# TimescaleDB 테이블 이름
+table_reanalysis = "env_ecmwf_reanalysis"
+
+# TimescaleDB 청크 시간 간격
+# 시계열 데이터를 이 단위로 나눠서 저장 → 쿼리 성능 향상
+chunk_time_interval = "7 days"
+
+# DB 적재 시 한 번에 INSERT할 행 수
+# 너무 크면 메모리 부족, 너무 작으면 느림
+batch_size = 50000
+
+[hycom]
+# HYCOM 데이터 공간 해상도 조절 간격
+# 원본 해상도: 0.08° / stride=3 적용 → 0.24° (ERA5의 0.25°와 유사)
+# stride=1: 원본 그대로 (0.08°, 파일 크기 매우 큼)
+# stride=3: 권장값 — ERA5와 유사한 해상도 (0.24°)
+# stride=6: 저해상도 (0.48°, 파일 크기 작음)
+stride = 3
+
+[ecmwf_forecast]
+# ECMWF HRES 예보 기간 (일)
+# Open Data 무료 제공: 최대 10일 (240시간)
+forecast_days = 10
+
+# 예보 시간 간격 (시간)
+# HRES는 0~144h: 3h 간격, 144~240h: 6h 간격
+# 여기서는 6h 단위로 통일 (단순화)
+step_hours = 6
+
+[hycom_forecast]
+# HYCOM 예보 기간 (일) — FMRC Best 최대 5일
+forecast_days = 5
+
+[noaa_forecast]
+# NOAA WaveWatch III 예보 기간 (일) — PacIOOS WW3 최대 약 7일
+# ECMWF Open Data에서 수집 불가한 너울/풍파 분리 변수 9개를 여기서 보완
+forecast_days = 5
+
+[paths]
+# 다운로드된 NetCDF 파일 저장 위치 (ECMWF 재분석)
+ecmwf_reanalysis_dir = "data/ecmwf/reanalysis"
+
+# 다운로드된 NetCDF 파일 저장 위치 (HYCOM 분석 해류)
+hycom_current_dir = "data/hycom/current"
+
+# 다운로드된 NetCDF 파일 저장 위치 (ECMWF 예보)
+ecmwf_forecast_dir = "data/ecmwf/forecast"
+
+# 다운로드된 NetCDF 파일 저장 위치 (HYCOM 예보 해류)
+hycom_forecast_dir = "data/hycom/forecast"
+
+# 다운로드된 NetCDF 파일 저장 위치 (NOAA WW3 파랑 예보)
+noaa_forecast_dir = "data/noaa/forecast"
+
+# 로그 파일 저장 위치
+log_dir = "logs"
