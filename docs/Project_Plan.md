@@ -4,7 +4,7 @@
 > **담당자**: 이훈정 책임 (한화오션)
 > **담당 범위**: 환경 데이터 수집 → PostgreSQL(TimescaleDB) 적재 파이프라인
 > **작업 환경**: Windows 11 + WSL2 (Ubuntu) / Python 3.12 / UV / Docker Desktop
-> **최초 작성일**: 2026-03-15 (KST) | **최종 수정일**: 2026-03-16 (KST, Phase 8 완료)
+> **최초 작성일**: 2026-03-15 (KST) | **최종 수정일**: 2026-03-17 (KST, Phase 9 완료)
 
 ---
 
@@ -42,8 +42,9 @@
 | 데이터 | 출처 | 변수 | 해상도 | 예보 기간 |
 |--------|------|------|--------|----------|
 | 바람 예보 | ECMWF Open Data (ecmwf-opendata 라이브러리) | u10, v10 | 0.25° | 10일 |
-| 파랑 예보 | ECMWF Open Data | swh, mwd, mwp **3개만** (너울·풍파 6개 미제공) | 0.25° | 10일 |
-| 파랑 예보 (보완) | **NOAA WaveWatch III (PacIOOS ERDDAP)** | swh, mwd, mwp, shts, mdts, mpts, shww, mdww, mpww **9개 완전** | 0.5° | 5일 |
+| ~~파랑 예보~~ | ~~ECMWF Open Data~~ | ~~swh, mwd, mwp 3개만 (너울·풍파 6개 미제공)~~ | ~~0.25°~~ | ~~10일~~ |
+| ↑ **수집 중단** (2026-03-17) | NOAA WW3로 통합 — ECMWF 무료 tier 6개 변수 미제공 확인 | | | |
+| 파랑 예보 | **NOAA WaveWatch III (PacIOOS ERDDAP)** | swh, mwd, mwp, shts, mdts, mpts, shww, mdww, mpww **9개 완전** | 0.5° | 5일 |
 | 해류 예보 | HYCOM Forecast OPeNDAP | water_u, water_v | ~0.24° | 5일 |
 
 ---
@@ -79,9 +80,9 @@
   ────────────  ──────────────────────────  ──────────────────────────────
   [ERA5 재분석]  [ERA5T]              [HYCOM 분석]
                           ↑ 공백 구간 ↑     [ECMWF 예보(바람) 10일         ]
-                                            [ECMWF 예보(파랑 3개) 10일     ]
                                             [NOAA WW3 예보(파랑 9개) 5일   ]
                                             [HYCOM 예보(해류) 5일           ]
+  ※ ECMWF 예보 파랑은 2026-03-17 수집 중단 → NOAA WW3로 통합
 
 공백 처리 전략 (B안+C안 조합):
   ① ERA5T : D-3까지 재분석 수준 데이터 (CDS API, 기존 코드 파라미터만 추가)
@@ -156,8 +157,8 @@ llm_for_ship/
 │   │   │   ├── ecmwf_wind_YYYYMMDD.nc
 │   │   │   └── ecmwf_wave_YYYYMMDD.nc
 │   │   └── forecast/YYYY/MM/
-│   │       ├── ecmwf_fc_wind_YYYYMMDD.nc
-│   │       └── ecmwf_fc_wave_YYYYMMDD.nc   (swh/mwd/mwp 3개만)
+│   │       └── ecmwf_fc_wind_YYYYMMDD.nc   (u10/v10 — 바람만)
+│   │           ※ ecmwf_fc_wave_*.nc 수집 중단 (2026-03-17, NOAA WW3로 통합)
 │   ├── hycom/
 │   │   ├── current/YYYY/MM/
 │   │   │   └── hycom_current_YYYYMMDD.nc
@@ -252,9 +253,9 @@ llm_for_ship/
 - [x] `pyproject.toml`: `ecmwf-opendata`, `cfgrib`, `eccodes` 의존성 추가
 - [x] `src/env_pipeline/ecmwf/ecmwf_forecast_downloader.py`
   - `ecmwf-opendata` 라이브러리 → GRIB2 다운로드 → `cfgrib`으로 xarray 변환
-  - 바람(u10/v10), 파랑(9변수) 분리 다운로드 후 NetCDF 저장
+  - 바람(u10/v10) 다운로드 후 NetCDF 저장 (**파랑은 Phase 9에서 제거**)
   - `issued_at` → `ds.attrs["issued_at"]` 에 저장
-  - 저장: `data/ecmwf/forecast/YYYY/MM/ecmwf_fc_wind_YYYYMMDD.nc`, `ecmwf_fc_wave_YYYYMMDD.nc`
+  - 저장: `data/ecmwf/forecast/YYYY/MM/ecmwf_fc_wind_YYYYMMDD.nc`
 - [x] `src/env_pipeline/hycom/hycom_forecast_downloader.py`
   - HYCOM FMRC Best OPeNDAP URL: `FMRC_ESPC-D-V02_uv3z_best.ncd#fillmismatch`
   - 분석 다운로더와 동일한 방식, URL/시간범위만 다름
@@ -372,6 +373,41 @@ llm_for_ship/
 
 ---
 
+### Phase 9 — ECMWF 예보 파랑 수집 완전 제거 (2026-03-17 KST)
+
+**배경:**
+- Phase 7에서 ECMWF Open Data 파랑은 swh/mwd/mwp 3개만 무료 제공임을 확인
+- Phase 8에서 NOAA WW3로 9개 변수 완전 수집 완료 및 검증
+- 5일 예보로 충분하다는 판단 + 이중 수집 불필요 → ECMWF 파랑 수집 제거 결정
+
+**제거 내용:**
+
+- [x] `src/env_pipeline/ecmwf/ecmwf_forecast_downloader.py`
+  - `WAVE_PARAMS_FULL`, `WAVE_PARAMS_BASIC` 상수 제거
+  - `_download_wave()` 메서드 전체 제거 (~80줄)
+  - `run()`: 바람 전용으로 단순화 (1/1 파일, "1/2, 2/2" 표시 제거)
+  - docstring 갱신: 파랑은 NOAA WW3 전담 명시
+
+- [x] `src/env_pipeline/db/schema.py`
+  - `env_ecmwf_forecast` 테이블에서 파랑 9개 컬럼 완전 제거 (u10/v10만 유지)
+  - 제거된 컬럼: swh, mwd, mwp, shts, mdts, mpts, shww, mdww, mpww
+
+- [x] `src/env_pipeline/db/loader.py`
+  - `ECMWF_FC_WAVE_COLUMNS` 상수 제거
+  - `ecmwf_fc_wave` 파일 라우팅 브랜치 제거
+
+- [x] `scripts/check_forecast_vars.py`
+  - `FILE_PATTERNS`에서 `ecmwf_fc_wave` 패턴 제거
+  - 주석 추가: "ecmwf_fc_wave는 수집 중단 (2026-03-17)"
+
+- [x] `data/ecmwf/forecast/2026/03/ecmwf_fc_wave_20260315.nc` 삭제 (59.46 MB)
+- [x] `data/ecmwf/forecast/2026/03/ecmwf_fc_wave_20260316.nc` 삭제 (59.46 MB)
+
+**GitHub Push:**
+- [x] commit `afc8d35` — "refactor: ECMWF 예보 파랑 수집 제거 — NOAA WW3로 전담"
+
+---
+
 ## 6. 설정 파일 상세
 
 ### config/settings.toml (현재)
@@ -461,17 +497,14 @@ CREATE TABLE env_hycom_current (
 ### 7-2. 추가된 테이블 (예보) ✅ 구현 완료 (DB 적재 테스트 미완료)
 
 ```sql
--- ECMWF 예보 (바람 + 파랑 통합)
--- ※ shts, mdts, mpts, shww, mdww, mpww 6개는 Open Data 미제공 → NULL
+-- ECMWF 예보 (바람만 — ✅ Phase 9에서 파랑 컬럼 완전 제거 2026-03-17)
+-- ※ ECMWF Open Data 무료 tier 파랑 미제공 확인 → NOAA WW3(env_noaa_forecast)로 통합
 CREATE TABLE env_ecmwf_forecast (
     issued_at TIMESTAMPTZ NOT NULL,
     datetime  TIMESTAMPTZ NOT NULL,
     lat       REAL        NOT NULL,
     lon       REAL        NOT NULL,
-    swh REAL, mwd REAL, mwp REAL,
-    shts REAL, mdts REAL, mpts REAL,    -- NULL (ECMWF 미제공)
-    shww REAL, mdww REAL, mpww REAL,    -- NULL (ECMWF 미제공)
-    u10 REAL, v10 REAL,
+    u10 REAL, v10 REAL,                 -- 10m 동서/남북 풍속
     PRIMARY KEY (issued_at, datetime, lat, lon)
 );
 
@@ -503,7 +536,7 @@ CREATE TABLE env_noaa_forecast (
 > **issued_at 컬럼이 필요한 이유**: 같은 미래 시각(예: 3일 후 12:00)의 예보가 매일 갱신되므로
 > 어떤 날 발행된 예보인지 구분해야 함. LLM Agent는 최신 issued_at 기준으로 조회.
 
-> **ECMWF wave NULL 처리 계획**: NOAA 파이프라인 안정 확인 후 `env_ecmwf_forecast`의 wave 6개 컬럼 삭제 예정.
+> **ECMWF wave 컬럼 제거 완료 (2026-03-17)**: `env_ecmwf_forecast`는 u10/v10 바람 전용. 파랑 9개 변수는 `env_noaa_forecast` 참조.
 
 ---
 
@@ -568,19 +601,33 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 - [x] `noaa_fc_wave_20260316.nc` 다운로드 및 9개 변수 검증 완료
 - [x] GitHub `https://github.com/Melanius/weather_pipeline` 초기 Push
 
+#### Step 4. ECMWF 예보 파랑 수집 제거 (Phase 9, 2026-03-17)
+- [x] NOAA WW3 9개 변수 완전 제공 검증 완료 → ECMWF 파랑 수집 불필요 판단
+- [x] `ecmwf_forecast_downloader.py`에서 `_download_wave()` 제거
+- [x] `schema.py` `env_ecmwf_forecast` 파랑 9개 컬럼 제거 (u10/v10만 유지)
+- [x] `loader.py` `ECMWF_FC_WAVE_COLUMNS` 및 라우팅 제거
+- [x] `check_forecast_vars.py` `ecmwf_fc_wave` 패턴 제거
+- [x] 기존 `ecmwf_fc_wave_*.nc` 파일 2개 삭제 (118.9 MB 회수)
+- [x] commit `afc8d35` push 완료
+
 ### ⭐ 즉시 (다음 세션 첫 번째 작업)
 
-#### Step 4. DB 적재 테스트
+#### Step 5. DB 적재 테스트
 - [ ] Docker Desktop 기동 → `uv run python run.py --init-db`
-  - 5개 테이블 정상 생성 확인 (env_ecmwf_reanalysis, env_hycom_current, env_ecmwf_forecast, env_hycom_forecast, **env_noaa_forecast**)
+  - 5개 테이블 정상 생성 확인:
+    - `env_ecmwf_reanalysis` (바람+파랑 통합)
+    - `env_hycom_current` (해류 분석)
+    - `env_ecmwf_forecast` (바람만 — u10/v10)  ← Phase 9 변경 반영
+    - `env_hycom_forecast` (해류 예보)
+    - `env_noaa_forecast` (파랑 예보 9개)
 - [ ] `down.json` 날짜 안전 범위 재설정 후 재분석 다운로드 재확인
   - `{"start_date": "2026-03-01", "end_date": "2026-03-09"}`
 - [ ] `uv run python run.py --mode load_only` → 재분석 DB 적재 확인
-- [ ] `uv run python run.py --mode forecast` → 예보 DB 적재 확인 (ECMWF + HYCOM + NOAA)
+- [ ] `uv run python run.py --mode forecast` → 예보 DB 적재 확인 (ECMWF 바람 + HYCOM + NOAA)
 
 ### 중기
 - [ ] **스케줄러**: 매일 오전 8시 KST 자동 실행 (APScheduler 또는 cron)
-- [ ] **ECMWF wave 컬럼 정리**: NOAA 파이프라인 안정 후 `env_ecmwf_forecast`의 너울·풍파 6개 컬럼 삭제
+- [x] ~~**ECMWF wave 컬럼 정리**~~: Phase 9에서 완료 (2026-03-17)
 - [ ] **ERA5T 명시적 수집**: CDS API `product_type` 파라미터 조정 검토
 - [ ] **Spec 문서**: `specs/hycom_current.md`, `specs/noaa_forecast.md` 작성
 
@@ -660,17 +707,22 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 - **파일 크기**: 약 369 MB/일 (48 스텝 × 311×720 격자점 × 9변수)
 - `sper`/`wper` 변수: `units="seconds"` → xarray timedelta64 오해석 → 저장 시 `units="wave_seconds"`, 읽기 시 `decode_timedelta=False` 필수
 
-### ECMWF wave 컬럼 NULL 처리 계획
-- 현재: `env_ecmwf_forecast`의 shts, mdts, mpts, shww, mdww, mpww 6개 컬럼이 NULL로 적재
-- 향후: `env_noaa_forecast` 파이프라인 안정화 후 해당 컬럼 삭제 예정
-- LLM Agent 개발 시 파랑 분리 변수는 `env_noaa_forecast` 테이블에서 조회
+### ECMWF wave 컬럼 제거 완료 (2026-03-17)
+- `env_ecmwf_forecast`의 파랑 9개 컬럼 완전 제거, u10/v10 바람 전용 테이블로 확정
+- 파랑 예보(9개 변수)는 `env_noaa_forecast` 테이블에서 전담
+- LLM Agent 개발 시: 바람 → `env_ecmwf_forecast`, 파랑 → `env_noaa_forecast`, 해류 → `env_hycom_forecast`
 
 ---
 
 ## 12. GitHub 저장소
 
 - **URL**: https://github.com/Melanius/weather_pipeline
-- **초기 Push**: 2026-03-16 (KST)
 - **브랜치**: `main`
 - **포함 내용**: 전체 소스코드, 설정 파일, 문서, 스크립트
 - **제외 항목**: `data/` (NetCDF 파일), `logs/`, `.env` (API 키/DB 비밀번호)
+
+| 커밋 | 날짜 | 내용 |
+|------|------|------|
+| `b634a15` | 2026-03-16 | feat: 환경 데이터 수집 파이프라인 초기 구축 (36개 파일) |
+| `c12e947` | 2026-03-16 | docs: Project Plan Phase 8 내용 반영 (NOAA WW3 파이프라인) |
+| `afc8d35` | 2026-03-17 | refactor: ECMWF 예보 파랑 수집 제거 — NOAA WW3로 전담 |
