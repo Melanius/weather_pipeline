@@ -120,27 +120,19 @@ SELECT add_compression_policy(
 # ECMWF 예보 데이터 테이블
 # ─────────────────────────────────────────────────────
 
-# ECMWF HRES 예보 테이블 (재분석 테이블 + issued_at 컬럼)
+# ECMWF HRES 예보 테이블 — 바람(u10, v10) 전용
 # issued_at: 예보 발행 시각 (언제 만들어진 예보인지)
 # datetime:  예보가 나타내는 실제 시각 (valid_time)
 # 동일 valid_time에 대해 매일 새 예보가 갱신되므로 issued_at 구분 필수
+#
+# ※ 파랑 변수는 env_noaa_forecast 테이블에서 전담
+#   (ECMWF Open Data 무료 tier에서 너울·풍파 6개 변수 미제공 확인 2026-03-17)
 SQL_CREATE_ECMWF_FORECAST_TABLE = """
 CREATE TABLE IF NOT EXISTS env_ecmwf_forecast (
     issued_at TIMESTAMPTZ NOT NULL,  -- 예보 발행 시각 (run time, UTC)
     datetime  TIMESTAMPTZ NOT NULL,  -- 예보 유효 시각 (valid time, UTC)
     lat       REAL        NOT NULL,  -- 위도
     lon       REAL        NOT NULL,  -- 경도
-
-    -- 파랑(Wave) 변수 (ecmwf_fc_wave_* 파일에서 채워짐)
-    swh   REAL,   -- 복합 유의파고 (m)
-    mwd   REAL,   -- 평균 파랑 방향 (°)
-    mwp   REAL,   -- 평균 파랑 주기 (s)
-    shts  REAL,   -- 너울 유의파고 (m)
-    mdts  REAL,   -- 너울 방향 (°)
-    mpts  REAL,   -- 너울 주기 (s)
-    shww  REAL,   -- 풍파 유의파고 (m)
-    mdww  REAL,   -- 풍파 방향 (°)
-    mpww  REAL,   -- 풍파 주기 (s)
 
     -- 바람(Wind) 변수 (ecmwf_fc_wind_* 파일에서 채워짐)
     u10   REAL,   -- 10m 동서 풍속 (m/s)

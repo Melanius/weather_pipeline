@@ -5,19 +5,23 @@ ECMWF HRES 예보 데이터 다운로드 모듈
 ECMWF HRES(High-Resolution Forecast)란?
   - 유럽중기예보센터(ECMWF)의 고해상도 결정론적 예보 모델
   - 세계 최고 수준의 기상 예보 정확도
-  - 바람(u10, v10) + 파랑(swh, mwd, mwp 등) ERA5와 동일 변수 제공
 
 접근 방식: ECMWF Open Data (ecmwf-opendata 라이브러리)
   - CDS API(재분석용)와 완전히 별개의 라이브러리
   - 인증 불필요 (무료 공개 데이터)
   - 다운로드 형식: GRIB2 → cfgrib으로 xarray 변환 → NetCDF 저장
 
+수집 범위: 바람(u10, v10)만 수집
+  - 파랑 9개 변수는 NOAA WaveWatch III (env_noaa_forecast) 에서 전담 수집
+  - ECMWF Open Data 무료 tier에서 너울·풍파 6개 변수 미제공 확인 (2026-03-16)
+  → NOAA WW3가 파랑 9개 완전 제공하므로 ECMWF wave 수집 불필요
+
 예보 기간: 발행일 기준 최대 10일 (0~240시간)
 시간 간격: 6시간 (0, 6, 12, ..., 240시 → 41 스텝)
 공간 해상도: 0.25° (전세계)
 경도 변환: 0~360 → -180~180 (ERA5 재분석과 좌표계 통일)
 
-저장 경로: data/ecmwf/forecast/YYYY/MM/ecmwf_fc_{wind|wave}_YYYYMMDD.nc
+저장 경로: data/ecmwf/forecast/YYYY/MM/ecmwf_fc_wind_YYYYMMDD.nc
   - YYYYMMDD: 예보 발행일 (issued_at)
   - NetCDF 전역 속성에 issued_at 저장 (DB 적재 시 사용)
 """
@@ -42,21 +46,7 @@ from loguru import logger
 # 바람 예보 변수 (단축명 → DB 컬럼명)
 # ecmwf-opendata: "10u", "10v" / cfgrib 변환 후: "u10", "v10"
 WIND_PARAMS = ["10u", "10v"]   # GRIB2 short name 기준
-
-# 파랑 예보 변수 (단축명)
-# 전체 9개 시도 → 실패 시 기본 3개로 fallback
-WAVE_PARAMS_FULL = [
-    "swh",   # 복합 유의파고 (m)
-    "mwd",   # 평균 파랑 방향 (°)
-    "mwp",   # 평균 파랑 주기 (s)
-    "shts",  # 너울 유의파고 (m)   ← Open Data 미제공 시 NaN
-    "mdts",  # 너울 방향 (°)       ← Open Data 미제공 시 NaN
-    "mpts",  # 너울 주기 (s)       ← Open Data 미제공 시 NaN
-    "shww",  # 풍파 유의파고 (m)
-    "mdww",  # 풍파 방향 (°)
-    "mpww",  # 풍파 주기 (s)
-]
-WAVE_PARAMS_BASIC = ["swh", "mwd", "mwp"]  # 반드시 제공되는 기본 3개 (fallback)
+# ※ 파랑 변수는 NOAA WW3에서 전담 수집 (env_noaa_forecast 테이블)
 
 
 def _build_forecast_steps(step_hours: int) -> list[int]:
@@ -230,11 +220,10 @@ class ECMWFForecastDownloader:
         저장 파일 경로 생성
 
         경로 예: data/ecmwf/forecast/2026/03/ecmwf_fc_wind_20260315.nc
-                                              ecmwf_fc_wave_20260315.nc
 
         Parameters
         ----------
-        data_type   : str       →  "wind" 또는 "wave"
+        data_type   : str       →  "wind"
         issued_date : datetime  →  예보 발행일
         """
         # 연/월 폴더 생성
@@ -320,123 +309,20 @@ class ECMWFForecastDownloader:
             if grib_path.exists():
                 grib_path.unlink()
 
-    def _download_wave(
-        self,
-        steps: list[int],
-        tmp_dir: str,
-        issued_at: pd.Timestamp | None,
-    ) -> Path | None:
-        """
-        파랑 예보 GRIB2 다운로드 및 NetCDF 변환
-
-        Parameters
-        ----------
-        steps     : list[int]               →  예보 스텝 목록
-        tmp_dir   : str                     →  임시 파일 폴더
-        issued_at : pd.Timestamp | None     →  바람 다운로드에서 얻은 발행 시각
-
-        Returns
-        -------
-        Path | None  →  저장 경로
-        """
-        grib_path = Path(tmp_dir) / "ecmwf_fc_wave_temp.grib2"
-
-        try:
-            from ecmwf.opendata import Client
-
-            client = Client("ecmwf")
-
-            # ── 파랑 변수 다운로드 시도 (전체 9개 → 실패 시 기본 3개로 재시도) ──
-            wave_params_used = WAVE_PARAMS_FULL
-
-            for attempt, params in enumerate([WAVE_PARAMS_FULL, WAVE_PARAMS_BASIC], start=1):
-                try:
-                    logger.debug(
-                        f"  파랑 GRIB2 다운로드 중... "
-                        f"(시도 {attempt}/2, 변수 수: {len(params)})"
-                    )
-                    client.retrieve(
-                        type="fc",
-                        stream="wave",    # 파랑 모델 스트림 (대기 모델 "oper"와 별개)
-                        param=params,
-                        step=steps,
-                        target=str(grib_path),
-                    )
-                    wave_params_used = params
-                    logger.debug(f"  GRIB2 다운로드 완료: {grib_path.stat().st_size / 1024 / 1024:.1f} MB")
-                    break  # 성공 시 반복 종료
-
-                except Exception as e:
-                    if attempt == 1:
-                        # 전체 변수 실패 → 기본 변수로 재시도
-                        logger.warning(
-                            f"  파랑 전체 변수 실패 → 기본 변수(swh, mwd, mwp)로 재시도: {e}"
-                        )
-                        if grib_path.exists():
-                            grib_path.unlink()
-                    else:
-                        # 기본 변수도 실패 → 오류
-                        raise
-
-            # ── GRIB2 → xarray Dataset 변환 ──
-            ds = _grib2_to_dataset(grib_path, wave_params_used)
-            ds, ds_issued_at = _restructure_forecast_dataset(ds)
-
-            # issued_at: 바람에서 이미 구했으면 재사용, 아니면 파랑에서 사용
-            final_issued_at = issued_at if issued_at is not None else ds_issued_at
-
-            # ── 저장 경로 결정 ──
-            output_path = self._get_output_path("wave", final_issued_at.to_pydatetime())
-
-            # 이미 파일 있으면 건너뜀
-            if output_path.exists() and output_path.stat().st_size > 0:
-                size_mb = output_path.stat().st_size / (1024 * 1024)
-                logger.info(f"[건너뜀] {output_path.name} ({size_mb:.1f} MB)")
-                return output_path
-
-            # 받은 파랑 변수 목록 로그
-            downloaded_vars = [v for v in wave_params_used if v in ds.data_vars or v in ds.coords]
-            logger.info(f"  다운로드된 파랑 변수: {downloaded_vars}")
-            if wave_params_used == WAVE_PARAMS_BASIC:
-                logger.warning(
-                    "  ⚠ 기본 변수만 다운로드됨 (너울 성분 없음). "
-                    "ECMWF Open Data에서 shts/mdts/mpts 미제공일 수 있음."
-                )
-
-            # ── NetCDF 전역 속성 저장 ──
-            ds.attrs["issued_at"] = final_issued_at.isoformat()
-            ds.attrs["forecast_days"] = self.forecast_days
-            ds.attrs["source"] = "ECMWF Open Data HRES"
-            ds.attrs["wave_params"] = str(wave_params_used)
-
-            # ── NetCDF 저장 ──
-            ds.to_netcdf(str(output_path))
-
-            size_mb = output_path.stat().st_size / (1024 * 1024)
-            logger.success(f"[완료] {output_path.name} | {size_mb:.1f} MB")
-            return output_path
-
-        except Exception as e:
-            logger.error(f"[실패] 파랑 예보 다운로드: {e}")
-            return None
-
-        finally:
-            if grib_path.exists():
-                grib_path.unlink()
-
     def run(self) -> list[Path]:
         """
-        ECMWF 예보 데이터 다운로드 실행 (바람 + 파랑)
+        ECMWF 예보 데이터 다운로드 실행 (바람만)
 
         항상 최신 예보 기준으로 1회 다운로드.
         (날짜 범위 입력 불필요 — 예보는 항상 '오늘부터 10일')
+        파랑 예보는 NOAA WW3 (NOAAForecastDownloader) 에서 전담 수집.
 
         Returns
         -------
         list[Path]  →  성공적으로 저장된 파일 경로 목록
         """
         logger.info("=" * 50)
-        logger.info("ECMWF HRES 예보 다운로드 시작")
+        logger.info("ECMWF HRES 예보 다운로드 시작 (바람 전용)")
         logger.info(f"  예보 기간: {self.forecast_days}일 / 스텝: {self.step_hours}시간 간격")
         logger.info("=" * 50)
 
@@ -453,20 +339,13 @@ class ECMWFForecastDownloader:
         with tempfile.TemporaryDirectory() as tmp_dir:
 
             # ── 바람 예보 다운로드 ──
-            logger.info("[1/2] 바람 예보 다운로드 (u10, v10)")
+            logger.info("[1/1] 바람 예보 다운로드 (u10, v10)")
             wind_path, issued_at = self._download_wind(steps, tmp_dir)
             if wind_path:
                 downloaded.append(wind_path)
 
-            # ── 파랑 예보 다운로드 ──
-            # issued_at을 바람에서 받아서 재사용 (같은 예보 run 기준으로 통일)
-            logger.info("[2/2] 파랑 예보 다운로드 (swh, mwd, mwp 등)")
-            wave_path = self._download_wave(steps, tmp_dir, issued_at)
-            if wave_path:
-                downloaded.append(wave_path)
-
         logger.info(
             f"ECMWF 예보 다운로드 완료 | "
-            f"성공: {len(downloaded)}/2 파일"
+            f"성공: {len(downloaded)}/1 파일"
         )
         return downloaded

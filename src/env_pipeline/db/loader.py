@@ -58,18 +58,11 @@ HYCOM_CURRENT_COLUMNS = [
 # ─────────────────────────────────────────────────────
 
 # ECMWF 예보 wind 파일 컬럼 (ecmwf_fc_wind_YYYYMMDD.nc)
+# ※ 파랑 변수는 NOAA WW3에서 전담 → NOAA_FC_WAVE_COLUMNS 참조
 ECMWF_FC_WIND_COLUMNS = [
     "issued_at", "datetime", "lat", "lon",  # issued_at: 예보 발행 시각
     "u10",   # 동서 풍속 (m/s)
     "v10",   # 남북 풍속 (m/s)
-]
-
-# ECMWF 예보 wave 파일 컬럼 (ecmwf_fc_wave_YYYYMMDD.nc)
-ECMWF_FC_WAVE_COLUMNS = [
-    "issued_at", "datetime", "lat", "lon",
-    "swh", "mwd", "mwp",
-    "shts", "mdts", "mpts",
-    "shww", "mdww", "mpww",
 ]
 
 # HYCOM 예보 current 파일 컬럼 (hycom_fc_current_YYYYMMDD.nc)
@@ -118,8 +111,6 @@ def _detect_table_config(nc_path: Path) -> tuple[str, list[str]]:
     # 재분석 파일(ecmwf_wind_*)과 혼동하지 않도록 예보를 우선 처리
     if "ecmwf_fc_wind" in filename:
         return "env_ecmwf_forecast", ECMWF_FC_WIND_COLUMNS
-    elif "ecmwf_fc_wave" in filename:
-        return "env_ecmwf_forecast", ECMWF_FC_WAVE_COLUMNS
     elif "hycom_fc_current" in filename:
         return "env_hycom_forecast", HYCOM_FC_COLUMNS
     elif "noaa_fc_wave" in filename:
@@ -138,7 +129,7 @@ def _detect_table_config(nc_path: Path) -> tuple[str, list[str]]:
         raise ValueError(
             f"파일명으로 테이블을 판단할 수 없습니다: {nc_path.name}\n"
             f"재분석: ecmwf_wind_*, ecmwf_wave_*, hycom_current_*\n"
-            f"예보:   ecmwf_fc_wind_*, ecmwf_fc_wave_*, hycom_fc_current_*, noaa_fc_wave_*"
+            f"예보:   ecmwf_fc_wind_*, hycom_fc_current_*, noaa_fc_wave_*"
         )
 
 

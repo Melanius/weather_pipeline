@@ -42,12 +42,12 @@ import xarray as xr
 # 검사 대상 파일 패턴 (파일명 포함 문자열 → 변수 목록)
 # 파일을 열어서 이 변수들의 NaN 비율을 확인한다
 FILE_PATTERNS = {
-    "ecmwf_fc_wind":   ["u10", "v10"],
-    "ecmwf_fc_wave":   ["swh", "mwd", "mwp", "shts", "mdts", "mpts", "shww", "mdww", "mpww"],
+    "ecmwf_fc_wind":    ["u10", "v10"],
+    # ecmwf_fc_wave 는 수집 중단 (2026-03-17) — 파랑은 noaa_fc_wave 에서 전담
     "hycom_fc_current": ["water_u", "water_v"],
     # NOAA WW3: 다운로더에서 변수명을 ECMWF 컬럼명으로 미리 변환하므로
     # 검사 시에도 swh/mwd/... 로 확인 (NOAA 원래 이름 Thgt/Tdir/... 아님)
-    "noaa_fc_wave":    ["swh", "mwd", "mwp", "shts", "mdts", "mpts", "shww", "mdww", "mpww"],
+    "noaa_fc_wave":     ["swh", "mwd", "mwp", "shts", "mdts", "mpts", "shww", "mdww", "mpww"],
 }
 
 # 변수별 설명 (출력 시 표시)
