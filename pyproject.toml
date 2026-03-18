@@ -38,7 +38,11 @@ build-backend = "hatchling.build"
 packages = ["src/env_pipeline"]
 
 [tool.uv]
-# UV 의존성 해결 범위를 실제 실행 환경(Linux/WSL)으로 제한
-# 이유: ecmwf-opendata 1.3.0+이 Windows ARM64 Python 3.14에 미제공
-#       → 제한 없으면 "No solution found" 오류 발생
-environments = ["sys_platform == 'linux'"]
+# UV 의존성 해결 범위: Linux(WSL) + Windows x64 모두 허용
+# - Linux: WSL 개발 환경
+# - win32: 회사 로컬 PC (Windows 10/11 x64) 배포 환경
+# ※ ARM64 Windows는 제외 (ecmwf-opendata 휠 미제공)
+environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'win32'",
+]
