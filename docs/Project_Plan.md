@@ -131,13 +131,25 @@ docker compose down     # 종료
 
 ### 3-5. UV 환경 설정
 ```bash
+# WSL (개발 환경)
 cd /mnt/c/Users/hjlee/llm_for_ship
 uv sync    # 최초 1회 또는 pyproject.toml 변경 후
+
+# Windows (회사 로컬 PC 배포 환경)
+cd C:\Users\hjlee\llm_for_ship
+uv sync    # Windows x64 지원 추가됨 (2026-03-18)
 ```
 
-### 3-6. 다음 개발에서 추가될 라이브러리
+> **Windows 지원 (2026-03-18 추가)**: `pyproject.toml`의 `[tool.uv] environments`에 `sys_platform == 'win32'` 추가.
+> 이전에는 Linux 전용으로 잠금되어 Windows에서 `uv sync` 실패했음.
+> ※ `eccodes`/`cfgrib` (ECMWF 예보 GRIB2 처리) Windows 동작 여부는 회사 PC 셋팅 시 확인 필요.
+>   실패 시: `conda install -c conda-forge eccodes cfgrib` 으로 대체 설치.
+
+### 3-6. ~~다음 개발에서 추가될 라이브러리~~ (완료)
 ```
-ecmwf-opendata   # ECMWF 예보 다운로드 (CDS API와 별개)
+ecmwf-opendata   # ✅ 이미 추가됨 (Phase 6)
+cfgrib           # ✅ 이미 추가됨 (Phase 6)
+eccodes          # ✅ 이미 추가됨 (Phase 6)
 ```
 
 ---
@@ -726,3 +738,5 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 | `b634a15` | 2026-03-16 | feat: 환경 데이터 수집 파이프라인 초기 구축 (36개 파일) |
 | `c12e947` | 2026-03-16 | docs: Project Plan Phase 8 내용 반영 (NOAA WW3 파이프라인) |
 | `afc8d35` | 2026-03-17 | refactor: ECMWF 예보 파랑 수집 제거 — NOAA WW3로 전담 |
+| `55b9c0a` | 2026-03-17 | docs: Project Plan Phase 9 반영 (ECMWF 파랑 수집 제거 완료) |
+| `0c054b2` | 2026-03-18 | chore: pyproject.toml Windows x64 환경 지원 추가 |
