@@ -4,7 +4,7 @@
 > **담당자**: 이훈정 책임 (한화오션)
 > **담당 범위**: 환경 데이터 수집 → PostgreSQL(TimescaleDB) 적재 파이프라인
 > **작업 환경**: Windows 11 + WSL2 (Ubuntu) / Python 3.12 / UV / Docker Desktop
-> **최초 작성일**: 2026-03-15 (KST) | **최종 수정일**: 2026-03-17 (KST, Phase 9 완료)
+> **최초 작성일**: 2026-03-15 (KST) | **최종 수정일**: 2026-03-21 (KST, Phase 11 완료)
 
 ---
 
@@ -420,6 +420,74 @@ llm_for_ship/
 
 ---
 
+### Phase 10 — DB 적재 첫 테스트 (2026-03-21 KST)
+
+**배경:**
+- Phase 9까지 코드 완성 후 최초로 실제 DB 적재 테스트 수행
+- PC 재부팅 후 재시작 시 DB 적재 중 문제 발생하여 재시도
+
+**수행 내용:**
+
+- [x] Docker Desktop + TimescaleDB 컨테이너 기동 확인
+- [x] `uv run python run.py --init-db`: 5개 테이블 정상 생성 확인
+  - `env_ecmwf_reanalysis`, `env_hycom_current`
+  - `env_ecmwf_forecast`, `env_hycom_forecast`, `env_noaa_forecast`
+- [x] `down.json` 날짜 설정: `{"manual_start": "2026-03-05", "manual_end": "2026-03-12"}` (8일치)
+- [x] 재분석 데이터 다운로드 확인 (2026-03-05~12 범위 wind/wave .nc 파일)
+- [x] DB 적재 테스트 시도 → **적재 속도 심각하게 느림** 문제 발견
+  - INSERT ON CONFLICT 방식: 24.9M행 기준 10분+ 예상 → Phase 11로 최적화 진행
+
+---
+
+### Phase 11 — DB 적재 성능 최적화 (2026-03-21 KST)
+
+**문제:**
+- 기존 방식(INSERT ON CONFLICT DO UPDATE)이 TimescaleDB hypertable에서 극도로 느림
+- 단일 StringIO 버퍼에 24.9M행 전체 직렬화 → 메모리 과다 + 시간 과다
+- PostgreSQL 세션이 프로세스 강제 종료 후에도 잠금 유지 (blocking session)
+
+**최적화 내용:**
+
+- [x] **세션 블로킹 해제**: 프로세스 강제 종료 후 남은 DB 세션 `pg_terminate_backend(pid)` 로 수동 종료
+  - 방법: `docker exec llm_ship_timescaledb psql -U shipllm -d ship_env -c "SELECT pg_terminate_backend(<pid>);"`
+
+- [x] **청크 스트리밍 COPY 방식 도입**: `COPY_CHUNK_SIZE = 500_000`
+  - 24.9M행을 50개 청크(50만행 단위)로 분할하여 순차 COPY
+  - 단일 버퍼(1.8GB+) 대신 청크별 소량 버퍼로 메모리 절약
+
+- [x] **전략 A — 직접 COPY** (wind, hycom, 예보 파일 전용)
+  - `COPY {target_table} ({col_str}) FROM STDIN WITH (FORMAT csv, NULL '\\N')`
+  - 메인 테이블에 직접 청크 스트리밍 → 가장 빠름
+
+- [x] **전략 B — COPY → UPDATE** (wave 파일 전용)
+  - wind 파일이 먼저 적재(PK row 생성) 후 wave가 해당 행의 wave 컬럼만 채우는 구조
+  - `INSERT ON CONFLICT DO UPDATE` 대신 `tmp_load 임시 테이블 → CREATE INDEX → UPDATE main` 순서
+  - `SET LOCAL work_mem = '2GB'`: 24.9M 행 JOIN 해시 테이블이 디스크로 spill되는 것 방지
+  - UPDATE SQL 버그 수정: SET 절에 테이블 alias 불가 (`r.col = t.col` → `col = t.col`)
+
+**성능 측정 결과 (2026-03-05 1일치 기준):**
+
+| 파일 유형 | 전략 | 총 소요 시간 | 행수 |
+|-----------|------|------------|------|
+| ecmwf_wind_20260305.nc | A (직접 COPY) | **10.7분** | 24,917,760 |
+| ecmwf_wave_20260305.nc | B (COPY→UPDATE) | **21.9분** | 24,917,760 |
+
+> COPY 청크 50개 ~8분 / tmp_load 인덱스 ~30초 / UPDATE 쿼리 ~11.6분
+
+**현재 적재된 데이터 현황 (2026-03-21 기준):**
+
+| 항목 | 값 |
+|------|----|
+| 적재 날짜 | 2026-03-05 1일치 |
+| 총 행수 | 24,917,760 행 |
+| 시간 범위 | 2026-03-05 00:00~23:00 UTC (24시간) |
+| 격자 | 721 lat × 1440 lon (0.25°) |
+| wind 컬럼 | 24,917,760행 (전체) |
+| wave 컬럼 | 13,873,772행 (해양 55.7%) |
+| DB 용량 | **7.2 GB** (1일치, 비압축) |
+
+---
+
 ## 6. 설정 파일 상세
 
 ### config/settings.toml (현재)
@@ -622,32 +690,57 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 - [x] 기존 `ecmwf_fc_wave_*.nc` 파일 2개 삭제 (118.9 MB 회수)
 - [x] commit `afc8d35` push 완료
 
-### ⭐ 즉시 (다음 세션 첫 번째 작업)
+### ✅ 완료된 즉시 작업 (Phase 10~11, 2026-03-21)
 
-#### Step 5. DB 적재 테스트
-- [ ] Docker Desktop 기동 → `uv run python run.py --init-db`
-  - 5개 테이블 정상 생성 확인:
-    - `env_ecmwf_reanalysis` (바람+파랑 통합)
-    - `env_hycom_current` (해류 분석)
-    - `env_ecmwf_forecast` (바람만 — u10/v10)  ← Phase 9 변경 반영
-    - `env_hycom_forecast` (해류 예보)
-    - `env_noaa_forecast` (파랑 예보 9개)
-- [ ] `down.json` 날짜 안전 범위 재설정 후 재분석 다운로드 재확인
-  - `{"start_date": "2026-03-01", "end_date": "2026-03-09"}`
-- [ ] `uv run python run.py --mode load_only` → 재분석 DB 적재 확인
+#### Step 5. DB 적재 테스트 및 최적화 (Phase 10~11)
+- [x] Docker Desktop 기동 → `uv run python run.py --init-db` (5개 테이블 생성 확인)
+- [x] 재분석 데이터 다운로드 확인 (2026-03-05~12)
+- [x] DB 적재 성능 최적화 (Phase 11)
+  - Strategy A (직접 COPY): wind 10.7분 ✅
+  - Strategy B (COPY→UPDATE, work_mem=2GB): wave 21.9분 ✅
+- [x] 2026-03-05 1일치 wind+wave 적재 완료 (24,917,760행, 7.2GB)
+
+### ⭐ 즉시 (다음 작업)
+
+#### Step 5-1. 나머지 8일치 백필 (`--manual`, 2026-03-05~12)
+- [ ] `uv run python run.py --mode load_only --manual` 실행
+  - wind × 8일 + wave × 8일 (2026-03-05는 이미 완료, 2026-03-06~12 남음)
+  - hycom current × ? 일치
+  - 예상 소요: wind 7일 × 10.7분 + wave 8일 × 21.9분 ≈ 3~4시간 (이미 적재된 3/5 제외)
+- [ ] 적재 후 `SELECT COUNT(*), MIN(datetime), MAX(datetime) FROM env_ecmwf_reanalysis` 로 범위 확인
+
+#### Step 5-2. 예보 파이프라인 DB 적재 테스트
 - [ ] `uv run python run.py --mode forecast` → 예보 DB 적재 확인 (ECMWF 바람 + HYCOM + NOAA)
 
+#### Step 6. Phase 10 → Phase 12 — 파이프라인 상태 관리 시스템 개발
+> **상세 설계**: `specs/pipeline_state_management.md` 참조
+
+- [ ] **Phase 10-A**: `pipeline_coverage` 테이블 스키마 추가 + `--init-db` 연동
+- [ ] **Phase 10-B**: `src/env_pipeline/db/coverage.py` 신규 모듈 (상태 진단 엔진)
+  - CDS API 실제 가용 날짜 조회 (고정 -7일 폐기)
+  - HYCOM 롤링 윈도우 범위 확인
+- [ ] **Phase 10-C**: Cleanup + UPSERT 로직
+  - `cleanup_superseded_forecasts()`: 재분석 적재 완료 날짜 예보 DELETE
+  - ERA5T → ERA5 UPSERT 전환
+  - HYCOM 윈도우 초과 → permanent_forecast 승격
+- [ ] **Phase 10-D**: CLI 옵션 확장
+  - `--diagnose`: 현재 coverage 상태 출력
+  - `--simulate-date YYYY-MM-DD`: 테스트용 "오늘" 주입
+  - `--dry-run`: 실행 계획만 출력 (DB 변경 없음)
+  - `--manual`: down.json 기반 수동 백필
+- [ ] **Phase 10-E**: `settings.toml`에 `[pipeline]` 섹션 추가
+- [ ] **Phase 10-F**: 스케줄러 설정 (Windows 작업 스케줄러 + Linux cron 가이드)
+
 ### 중기
-- [ ] **스케줄러**: 매일 오전 8시 KST 자동 실행 (APScheduler 또는 cron)
-- [x] ~~**ECMWF wave 컬럼 정리**~~: Phase 9에서 완료 (2026-03-17)
 - [ ] **ERA5T 명시적 수집**: CDS API `product_type` 파라미터 조정 검토
 - [ ] **Spec 문서**: `specs/hycom_current.md`, `specs/noaa_forecast.md` 작성
+- [x] ~~**ECMWF wave 컬럼 정리**~~: Phase 9에서 완료 (2026-03-17)
+- [x] ~~**UPSERT 전환**~~: Phase 10-C에서 구현 예정
 
 ### 장기
-- [ ] **과거 전체 데이터**: 2021-01-01 ~ 현재 일괄 적재
-- [ ] **서버 이전**: 로컬 → 운영 서버
+- [ ] **과거 전체 데이터**: 2021-01-01 ~ 현재 일괄 적재 (`--manual` 옵션 활용)
+- [ ] **서버 이전**: 로컬 → 운영 서버 (Linux 환경 — 코드 변경 없이 동작)
 - [ ] **Ship Position JOIN 로직**: `floor("3h")` HYCOM 시각 매핑
-- [ ] **UPSERT 전환**: ERA5T → ERA5 덮어쓰기 (현재는 ON CONFLICT DO NOTHING)
 
 ---
 
@@ -658,12 +751,18 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 | ERA5 다운로드 단위 | 1일 1파일 (wind/wave 분리) | API 호출 수 48배 감소 |
 | HYCOM 해상도 조절 | stride=3 | ERA5 0.25°와 유사한 0.24° |
 | HYCOM 경도 변환 | 0~360 → -180~180 | ECMWF와 좌표계 통일 |
-| DB 적재 방식 | PostgreSQL COPY | INSERT 대비 10~50배 빠름 |
+| DB 적재 방식 | PostgreSQL COPY (청크 스트리밍, 500K행/청크) | INSERT 대비 10~50배 빠름, 단일 버퍼 OOM 방지 |
+| wind 적재 전략 | Strategy A: 직접 COPY to 메인 테이블 | INSERT ON CONFLICT 대비 훨씬 빠름 |
+| wave 적재 전략 | Strategy B: COPY → tmp_load → UPDATE | wind 행이 먼저 있어야 UPDATE 가능한 구조 |
+| work_mem 튜닝 | SET LOCAL work_mem = '2GB' (wave UPDATE 시) | 24.9M행 JOIN 해시 테이블 디스크 spill 방지 |
 | 테이블 설계 | wind+wave 통합 테이블 | PRIMARY KEY 중복 방지 |
 | 시간 기준 | 모두 UTC (TIMESTAMPTZ) | 국제 표준 |
 | 파일 자동 감지 | 파일명 패턴 | 하드코딩 제거, 확장성 |
-| 재분석 공백 처리 | B안+C안 (ERA5T + 예보 누적) | 개발 공수 최소, 5일 후 공백 자동 해소 |
-| ERA5T → ERA5 교체 | 1차: ON CONFLICT DO NOTHING | 품질 차이 미미, UPSERT는 추후 선택적 추가 |
+| 재분석 공백 처리 | 예보 임시 커버 → 재분석 제공 시 자동 교체 | 데이터 연속성 + 단일 진실 원칙 보장 |
+| ERA5T → ERA5 교체 | UPSERT (Phase 10-C) | ERA5T 적재 후 ERA5 최종본 자동 갱신 |
+| 파이프라인 상태 추적 | pipeline_coverage 테이블 (Phase 10) | 누락·부분적재·HYCOM 소실 자동 감지 |
+| ERA5 가용 날짜 조회 | CDS API 실제 조회 (고정 -7일 폐기) | 제공업체 지연 가변적이므로 맹목적 가정 금지 |
+| 테스트 전략 | --simulate-date + --dry-run | 1일 주기 로직을 분 단위로 빠르게 검증 가능 |
 | 예보 바람 출처 | ECMWF Open Data (ecmwf-opendata) | ERA5와 동일 변수, 10일 예보 |
 | 예보 파랑(3개) 출처 | ECMWF Open Data | swh/mwd/mwp만 무료 제공 |
 | 예보 파랑(9개) 출처 | **NOAA WW3 PacIOOS** (별도 테이블) | ECMWF 미제공 너울·풍파 6개 보완 |
@@ -679,9 +778,10 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 ## 11. 알려진 제약사항 및 주의사항
 
 ### ERA5 데이터 지연
-- ERA5 재분석: 현재 기준 약 **5일 지연** 제공
+- ERA5 재분석: 현재 기준 약 **5~8일 지연** 제공 (ECMWF 사정에 따라 가변)
 - ERA5T (근실시간): 약 **2~3일 지연** — CDS API에서 동일하게 접근 가능
-- `down.json`의 `end_date`를 이 기준 이후로 설정하면 CDS API 오류 발생
+- Phase 10부터 고정 -7일 가정 폐기 → CDS API 실제 가용 날짜 조회로 변경
+- Phase 9까지: `down.json`의 `end_date`를 이 기준 이후로 설정하면 CDS API 오류 발생
 
 ### ECMWF Open Data vs CDS API (중요)
 - 재분석(ERA5/ERA5T): `cdsapi` 라이브러리 사용
@@ -719,6 +819,18 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 - **파일 크기**: 약 369 MB/일 (48 스텝 × 311×720 격자점 × 9변수)
 - `sper`/`wper` 변수: `units="seconds"` → xarray timedelta64 오해석 → 저장 시 `units="wave_seconds"`, 읽기 시 `decode_timedelta=False` 필수
 
+### DB 용량 추정 (2026-03-21 측정 기준)
+- **1일치 (비압축)**: ~7.2 GB (env_ecmwf_reanalysis, wind+wave)
+- **8일치**: ~58 GB / **1년**: ~2.6 TB / **전체(2021~현재 5.2년)**: ~13 TB
+- **TimescaleDB 압축 후**: 5~10배 감소 예상 (~1.3~2.6 TB)
+- **현재 디스크**: Windows C드라이브 931G (사용 253G, 여유 **678G**) — 8일치 적재 가능
+- **압축 정책**: 30일 이상 청크 자동 압축 (schema.py 설정) → 압축 후 재적재 시 `decompress_chunk()` 필요
+
+### wave UPDATE 성능 제약 (2026-03-21 확인)
+- wave 파일 1일치: **21.9분** (COPY 8분 + 인덱스 30초 + UPDATE 11.6분)
+- work_mem=2GB 적용 중 — 메모리 여유 없을 경우 disk spill로 더 느려질 수 있음
+- wind 파일이 먼저 적재되어야 wave UPDATE 가능 (wind 행이 없으면 UPDATE 0건)
+
 ### ECMWF wave 컬럼 제거 완료 (2026-03-17)
 - `env_ecmwf_forecast`의 파랑 9개 컬럼 완전 제거, u10/v10 바람 전용 테이블로 확정
 - 파랑 예보(9개 변수)는 `env_noaa_forecast` 테이블에서 전담
@@ -740,3 +852,7 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 | `afc8d35` | 2026-03-17 | refactor: ECMWF 예보 파랑 수집 제거 — NOAA WW3로 전담 |
 | `55b9c0a` | 2026-03-17 | docs: Project Plan Phase 9 반영 (ECMWF 파랑 수집 제거 완료) |
 | `0c054b2` | 2026-03-18 | chore: pyproject.toml Windows x64 환경 지원 추가 |
+| `2d4b1e8` | 2026-03-18 | docs: Project Plan Windows 환경 지원 내용 반영 |
+| (미완료) | 2026-03-18 | docs: Phase 10 파이프라인 상태 관리 설계 반영 |
+| (예정) | 2026-03-21 | feat: DB 적재 성능 최적화 (Strategy A/B, COPY 청크 스트리밍) |
+| (예정) | 2026-03-21 | docs: Project Plan Phase 10~11 반영 |
