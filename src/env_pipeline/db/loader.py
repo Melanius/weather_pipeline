@@ -4,10 +4,17 @@ NetCDF → TimescaleDB 데이터 적재 모듈
 
 NetCDF 파일을 읽어서 TimescaleDB에 빠르게 적재함.
 
-적재 방식: PostgreSQL COPY 명령
-  - 일반 INSERT보다 약 10~50배 빠름
-  - 대용량 데이터(수백만 행)에 적합
-  - CSV 형태의 데이터를 메모리 버퍼를 통해 DB에 직접 복사
+적재 방식: PostgreSQL COPY + 임시 테이블 → INSERT ON CONFLICT
+  - COPY로 임시(TEMP) 테이블에 전체 데이터를 빠르게 올린 뒤
+  - INSERT ... ON CONFLICT 로 본 테이블에 이관
+  - 재분석 파일(wind, wave): ON CONFLICT DO UPDATE SET (자기 컬럼만 갱신)
+    → wind 파일이 먼저 들어온 후 wave 파일이 wave 컬럼만 업데이트하는 방식
+  - 예보 파일: ON CONFLICT DO NOTHING (동일 발행일+시각+위치 중복 무시)
+
+이 방식의 장점:
+  - wind/wave 두 파일이 같은 테이블(env_ecmwf_reanalysis)에 분리 적재 가능
+  - ERA5T → ERA5 교체(UPSERT) 지원
+  - 재시도 시 중복 없이 안전하게 적재
 """
 
 import io              # 메모리 내 버퍼 (파일 없이 CSV 데이터를 메모리에서 처리)
@@ -87,44 +94,88 @@ NOAA_FC_WAVE_COLUMNS = [
     "mpww",  # 풍파 주기 (s)     ← NOAA wper
 ]
 
+# ─────────────────────────────────────────────────────
+# 테이블 PK 및 UPSERT 정책 정의
+# ─────────────────────────────────────────────────────
 
-def _detect_table_config(nc_path: Path) -> tuple[str, list[str]]:
+# 테이블별 PRIMARY KEY 컬럼 목록
+TABLE_PK = {
+    "env_ecmwf_reanalysis": ["datetime", "lat", "lon"],
+    "env_hycom_current":    ["datetime", "lat", "lon"],
+    "env_ecmwf_forecast":   ["issued_at", "datetime", "lat", "lon"],
+    "env_hycom_forecast":   ["issued_at", "datetime", "lat", "lon"],
+    "env_noaa_forecast":    ["issued_at", "datetime", "lat", "lon"],
+}
+
+# 파일 유형별 ON CONFLICT 시 갱신할 컬럼 목록
+# None → ON CONFLICT DO NOTHING (예보 파일: 동일 발행일 중복 무시)
+# list → ON CONFLICT DO UPDATE SET (해당 컬럼만 갱신)
+UPSERT_UPDATE_COLS = {
+    "ecmwf_wind":    ["u10", "v10"],                              # 재분석 wind: wind 컬럼만 갱신
+    "ecmwf_wave":    ["swh", "mwd", "mwp",                       # 재분석 wave: wave 컬럼만 갱신
+                      "shts", "mdts", "mpts",
+                      "shww", "mdww", "mpww"],
+    "hycom_current": ["water_u", "water_v"],                      # HYCOM 분석: 해류 컬럼만 갱신
+    "ecmwf_fc_wind": None,                                        # 예보: DO NOTHING
+    "hycom_fc_current": None,
+    "noaa_fc_wave":  None,
+}
+
+# 임시 테이블 컬럼 타입 정의 (TEMP TABLE 생성용)
+COLUMN_TYPES = {
+    "datetime":  "TIMESTAMPTZ",
+    "issued_at": "TIMESTAMPTZ",
+    "lat":       "REAL",
+    "lon":       "REAL",
+    "u10":       "REAL",
+    "v10":       "REAL",
+    "swh":       "REAL",
+    "mwd":       "REAL",
+    "mwp":       "REAL",
+    "shts":      "REAL",
+    "mdts":      "REAL",
+    "mpts":      "REAL",
+    "shww":      "REAL",
+    "mdww":      "REAL",
+    "mpww":      "REAL",
+    "water_u":   "REAL",
+    "water_v":   "REAL",
+}
+
+
+def _detect_table_config(nc_path: Path) -> tuple[str, list[str], str, list[str] | None]:
     """
-    파일명을 보고 어느 테이블에 적재할지, 컬럼이 뭔지 자동 판단
+    파일명을 보고 어느 테이블에 적재할지, 컬럼, 파일 유형, UPSERT 갱신 컬럼을 자동 판단
 
     파일명 규칙:
-      ecmwf_wind_YYYYMMDD.nc  → env_ecmwf_reanalysis (wind 컬럼)
-      ecmwf_wave_YYYYMMDD.nc  → env_ecmwf_reanalysis (wave 컬럼)
-      hycom_current_YYYYMMDD.nc → env_hycom_current
-
-    Parameters
-    ----------
-    nc_path : Path  →  NetCDF 파일 경로
+      ecmwf_wind_YYYYMMDD.nc      → env_ecmwf_reanalysis (wind 컬럼)
+      ecmwf_wave_YYYYMMDD.nc      → env_ecmwf_reanalysis (wave 컬럼)
+      hycom_current_YYYYMMDD.nc   → env_hycom_current
+      ecmwf_fc_wind_YYYYMMDD.nc   → env_ecmwf_forecast
+      hycom_fc_current_YYYYMMDD.nc → env_hycom_forecast
+      noaa_fc_wave_YYYYMMDD.nc    → env_noaa_forecast
 
     Returns
     -------
-    tuple[str, list[str]]  →  (테이블명, 컬럼목록)
+    tuple: (테이블명, 컬럼목록, 파일유형키, UPSERT갱신컬럼)
     """
     filename = nc_path.name.lower()
 
-    # ── 예보 파일 (fc = forecast) 먼저 검사 ──
-    # 재분석 파일(ecmwf_wind_*)과 혼동하지 않도록 예보를 우선 처리
+    # ── 예보 파일 먼저 검사 (재분석 파일명 패턴과 혼동 방지) ──
     if "ecmwf_fc_wind" in filename:
-        return "env_ecmwf_forecast", ECMWF_FC_WIND_COLUMNS
+        return "env_ecmwf_forecast", ECMWF_FC_WIND_COLUMNS, "ecmwf_fc_wind", None
     elif "hycom_fc_current" in filename:
-        return "env_hycom_forecast", HYCOM_FC_COLUMNS
+        return "env_hycom_forecast", HYCOM_FC_COLUMNS, "hycom_fc_current", None
     elif "noaa_fc_wave" in filename:
-        # NOAA WW3 파랑 예보 → env_noaa_forecast 테이블
-        # 변수명은 다운로더에서 이미 ECMWF 컬럼명(swh, mwd 등)으로 변환됨
-        return "env_noaa_forecast", NOAA_FC_WAVE_COLUMNS
+        return "env_noaa_forecast", NOAA_FC_WAVE_COLUMNS, "noaa_fc_wave", None
 
     # ── 재분석/분석 파일 ──
     elif "ecmwf_wind" in filename:
-        return "env_ecmwf_reanalysis", ECMWF_WIND_COLUMNS
+        return "env_ecmwf_reanalysis", ECMWF_WIND_COLUMNS, "ecmwf_wind", UPSERT_UPDATE_COLS["ecmwf_wind"]
     elif "ecmwf_wave" in filename:
-        return "env_ecmwf_reanalysis", ECMWF_WAVE_COLUMNS
+        return "env_ecmwf_reanalysis", ECMWF_WAVE_COLUMNS, "ecmwf_wave", UPSERT_UPDATE_COLS["ecmwf_wave"]
     elif "hycom_current" in filename:
-        return "env_hycom_current", HYCOM_CURRENT_COLUMNS
+        return "env_hycom_current", HYCOM_CURRENT_COLUMNS, "hycom_current", UPSERT_UPDATE_COLS["hycom_current"]
     else:
         raise ValueError(
             f"파일명으로 테이블을 판단할 수 없습니다: {nc_path.name}\n"
@@ -136,40 +187,45 @@ def _detect_table_config(nc_path: Path) -> tuple[str, list[str]]:
 def load_netcdf_to_db(
     nc_path: Path,
     table_name: str = None,   # None이면 파일명으로 자동 판단
-    batch_size: int = 50_000,
+    batch_size: int = 50_000, # 사용되지 않음 (하위 호환 유지용)
 ) -> int:
     """
     NetCDF 파일 1개를 읽어서 TimescaleDB에 전체 적재
 
-    파일명에 따라 테이블과 컬럼을 자동 판단:
-      ecmwf_wind_*   → env_ecmwf_reanalysis (wind 컬럼)
-      ecmwf_wave_*   → env_ecmwf_reanalysis (wave 컬럼)
-      hycom_current_* → env_hycom_current
+    적재 방식: COPY to TEMP → INSERT ON CONFLICT (단일 트랜잭션)
+      - 임시 테이블에 전체 데이터를 한 번에 COPY (배치 루프 없음)
+      - INSERT ... ON CONFLICT 로 본 테이블에 한 번에 이관
+      - 커밋 1회 → 오버헤드 최소화
+
+      - 재분석 파일: ON CONFLICT DO UPDATE (자기 컬럼만 갱신)
+        → wind 파일 먼저 적재 후 wave 파일이 wave 컬럼을 업데이트하는 방식
+      - 예보 파일: ON CONFLICT DO NOTHING (동일 발행일 중복 무시)
 
     Parameters
     ----------
     nc_path    : Path   →  적재할 NetCDF 파일 경로
     table_name : str    →  테이블 이름 (None이면 파일명으로 자동 판단)
-    batch_size : int    →  한 번에 처리할 행 수 (메모리 조절용)
+    batch_size : int    →  미사용 (API 호환성 유지용)
 
     Returns
     -------
-    int  →  실제로 적재된 총 행 수
+    int  →  실제로 적재/갱신된 총 행 수
     """
-    # 파일명으로 테이블 및 컬럼 자동 판단
-    auto_table, table_columns = _detect_table_config(nc_path)
+    # 파일명으로 테이블, 컬럼, 파일유형, UPSERT 정책 자동 판단
+    auto_table, table_columns, file_type, update_cols = _detect_table_config(nc_path)
 
     # 명시적으로 테이블명이 전달된 경우 그것을 우선 사용
     target_table = table_name if table_name else auto_table
 
+    # PK 컬럼 목록 조회
+    pk_cols = TABLE_PK[target_table]
+
     logger.info(f"[적재 시작] {nc_path.name} → {target_table}")
 
     # ── 1단계: NetCDF 파일 읽기 ──
-    # xarray는 기상/해양 NetCDF 파일을 쉽게 읽는 라이브러리
-    # decode_times=True → 시간 데이터를 Python datetime으로 자동 변환
     logger.debug("  NetCDF 파일 로딩 중...")
     # NOAA WW3 파일: 파랑 주기 변수(mpts, mpww)가 units="wave_seconds"로 저장되나
-    # xarray 버전에 따라 timedelta로 오해석할 수 있어 decode_timedelta=False 적용
+    # xarray가 timedelta64로 오해석할 수 있으므로 decode_timedelta=False 적용
     is_noaa = "noaa_fc" in nc_path.name.lower()
     ds = xr.open_dataset(
         nc_path,
@@ -178,137 +234,171 @@ def load_netcdf_to_db(
     )
 
     # ── 1.5단계: 예보 파일인 경우 issued_at 전역 속성 추출 ──
-    # 예보 NetCDF 파일은 downloader가 issued_at을 전역 속성으로 저장함
-    # 재분석 파일에는 issued_at 속성이 없음 → None 반환
     issued_at = None
     if "issued_at" in ds.attrs:
-        # ISO 형식 문자열 → pandas Timestamp 변환 (UTC 명시)
         issued_at = pd.to_datetime(ds.attrs["issued_at"], utc=True)
         logger.debug(f"  issued_at 읽기 완료: {issued_at}")
 
     # ── 2단계: 데이터셋을 DataFrame으로 변환 ──
-    # NetCDF 구조: time × lat(itude) × lon(gitude) 3차원 격자
-    # to_dataframe()은 이를 멀티인덱스 DataFrame으로 변환
     logger.debug("  DataFrame 변환 중...")
-    df = ds.to_dataframe()
-
-    # 멀티인덱스(time, lat, lon)를 일반 컬럼으로 변환
-    df = df.reset_index()
+    df = ds.to_dataframe().reset_index()
 
     # ── 3단계: 컬럼명 정리 ──
     # 파일마다 좌표 컬럼명이 다를 수 있어 통일
-    # ECMWF 재분석: valid_time/time, latitude, longitude
-    # ECMWF 예보(cfgrib): valid_time, latitude, longitude
-    # HYCOM 분석/예보: time, lat, lon
     rename_map = {}
     if "valid_time" in df.columns:
-        rename_map["valid_time"] = "datetime"  # 예보/새 ERA5 API → valid_time
+        rename_map["valid_time"] = "datetime"   # 예보/새 ERA5 API
     elif "time" in df.columns:
-        rename_map["time"] = "datetime"        # HYCOM 및 구 ERA5 → time
+        rename_map["time"] = "datetime"          # HYCOM 및 구 ERA5
     if "latitude" in df.columns:
         rename_map["latitude"] = "lat"
     if "longitude" in df.columns:
         rename_map["longitude"] = "lon"
-
-    df = df.rename(columns=rename_map)  # 컬럼명 일괄 변경
+    df = df.rename(columns=rename_map)
 
     # ── 3.5단계: 예보 파일인 경우 issued_at 컬럼 추가 ──
-    # table_columns에 "issued_at"이 포함된 경우(예보 테이블)에만 추가
     if "issued_at" in table_columns:
         if issued_at is not None:
-            # 모든 행에 동일한 issued_at 값을 컬럼으로 추가
             df["issued_at"] = issued_at
         else:
-            # issued_at을 파일에서 읽지 못한 경우 → 현재 UTC 시각으로 대체
             logger.warning(
                 f"  issued_at을 파일에서 읽지 못함 → 현재 UTC 시각 사용: {nc_path.name}"
             )
             df["issued_at"] = pd.Timestamp.now(tz="UTC")
 
-    # ── 4단계: 필요한 컬럼만 선택 ──
-    # 파일 종류(wind/wave/current/forecast)에 따라 다른 컬럼 목록 사용
-    # NetCDF에 없는 변수는 NaN으로 채움
+    # ── 4단계: 필요한 컬럼만 선택 (없는 컬럼은 NaN으로 채움) ──
     for col in table_columns:
         if col not in df.columns:
-            df[col] = np.nan  # 없는 컬럼은 NaN으로 생성
-
-    # DB에 넣을 컬럼만 순서대로 선택
+            df[col] = np.nan
     df = df[table_columns]
 
-    # ── 5단계: 시간 컬럼 타임존 처리 ──
-    # 모든 시간 데이터는 UTC 기준으로 DB에 저장
-    if df["datetime"].dtype == "object" or str(df["datetime"].dtype).startswith("datetime"):
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-
-    # issued_at 컬럼도 UTC 처리 (예보 테이블에만 존재)
+    # ── 5단계: 시간 컬럼 타임존 처리 (모두 UTC) ──
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     if "issued_at" in df.columns:
         df["issued_at"] = pd.to_datetime(df["issued_at"], utc=True)
 
     total_rows = len(df)
     logger.info(f"  변환 완료: {total_rows:,}행 | 컬럼: {len(table_columns)}개")
 
-    # ── 6단계: DB에 COPY 방식으로 적재 ──
+    # ── 6단계: 파일 유형별 최적 적재 전략 선택 ──────────────────────────────
+    #
+    # 전략 A — 직접 COPY (wind / hycom / 예보):
+    #   TimescaleDB hypertable에 직접 COPY → ON CONFLICT 오버헤드 없음 (가장 빠름)
+    #   전제: 해당 날짜의 데이터가 아직 없는 최초 적재
+    #
+    # 전략 B — COPY → UPDATE (wave):
+    #   1) tmp_load에 청크 COPY (인덱스 없음 → COPY 빠름)
+    #   2) COPY 완료 후 tmp_load에 인덱스 생성
+    #   3) main 테이블 UPDATE tmp_load WHERE PK 일치
+    #   전제: 같은 날짜의 wind 행이 이미 있어야 함 (wind 먼저 적재 후 wave 적재)
+    #
+    # wave에서 INSERT ON CONFLICT DO UPDATE를 쓰지 않는 이유:
+    #   TimescaleDB hypertable에 24.9M 행 INSERT ON CONFLICT는 10분 이상 소요됨
+    #   반면 UPDATE는 인덱스 merge join으로 수 분 내 완료
+    # ────────────────────────────────────────────────────────────────────────
+    COPY_CHUNK_SIZE = 500_000   # COPY 청크 크기 (메모리 vs 속도 균형)
+
+    # wave 파일 여부 판단: wind/hycom/예보는 직접 COPY, wave는 UPDATE 전략
+    use_update_strategy = (file_type == "ecmwf_wave")
+
     conn = get_connection()
     total_loaded = 0
 
     try:
         cursor = conn.cursor()
+        col_str = ", ".join(table_columns)
+        pk_str  = ", ".join(pk_cols)
 
-        # 전체 데이터를 batch_size 단위로 나눠서 적재
-        # (한 번에 너무 많이 올리면 메모리 부족 가능)
-        num_batches = (total_rows // batch_size) + 1  # 총 배치 수 계산
+        if not use_update_strategy:
+            # ── 전략 A: 직접 COPY to 메인 테이블 ──────────────────────────
+            # COPY는 ON CONFLICT 없이 bulk insert → INSERT ON CONFLICT 대비 5~10배 빠름
+            # 주의: 이미 해당 날짜 데이터가 있으면 PK 위반 오류 발생
+            #   → 파이프라인은 pipeline_coverage 기반으로 재적재 방지
+            num_chunks = (total_rows + COPY_CHUNK_SIZE - 1) // COPY_CHUNK_SIZE
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * COPY_CHUNK_SIZE
+                end   = min(start + COPY_CHUNK_SIZE, total_rows)
+                chunk_df = df.iloc[start:end]
 
-        for batch_idx in range(num_batches):
-            # 현재 배치의 시작/끝 행 인덱스 계산
-            start_row = batch_idx * batch_size
-            end_row   = min(start_row + batch_size, total_rows)
+                buffer = io.StringIO()
+                chunk_df.to_csv(buffer, index=False, header=False, na_rep="\\N")
+                buffer.seek(0)
 
-            # 배치가 비어있으면 반복 종료
-            if start_row >= total_rows:
-                break
-
-            # 현재 배치 슬라이싱
-            batch_df = df.iloc[start_row:end_row]
-
-            # ─── COPY 방식 적재 ───
-            # 1) DataFrame → CSV 텍스트로 변환 (메모리 안에서만 처리, 파일 저장 X)
-            buffer = io.StringIO()
-            batch_df.to_csv(
-                buffer,
-                index=False,         # 행 번호(인덱스) 제외
-                header=False,        # 헤더(컬럼명) 제외 (COPY에서 별도 지정)
-                na_rep="\\N",        # NaN → PostgreSQL NULL 표기(\N)
-            )
-            buffer.seek(0)  # 버퍼 읽기 위치를 처음으로 되돌림
-
-            # 2) COPY 명령으로 DB에 빠르게 적재
-            # ON CONFLICT DO NOTHING → 이미 있는 (datetime, lat, lon) 조합이면 건너뜀
-            copy_sql = f"""
-                COPY {target_table} ({', '.join(table_columns)})
-                FROM STDIN WITH (
-                    FORMAT csv,
-                    NULL '\\N'
+                cursor.copy_expert(
+                    f"COPY {target_table} ({col_str}) FROM STDIN "
+                    f"WITH (FORMAT csv, NULL '\\N')",
+                    buffer,
                 )
-            """
-            cursor.copy_expert(copy_sql, buffer)
+                logger.debug(
+                    f"  COPY 청크 {chunk_idx + 1}/{num_chunks} 완료 "
+                    f"({start:,}~{end:,}행)"
+                )
+            total_loaded = total_rows
 
-            total_loaded += len(batch_df)
+        else:
+            # ── 전략 B: tmp_load COPY → main 테이블 UPDATE (wave 전용) ────
+            # step 1) 임시 테이블 생성 (인덱스 없음 → COPY 빠름)
+            col_defs = ", ".join(f"{c} {COLUMN_TYPES[c]}" for c in table_columns)
+            cursor.execute(f"CREATE TEMP TABLE tmp_load ({col_defs})")
 
-            logger.debug(
-                f"  배치 {batch_idx + 1}/{num_batches} 완료 | "
-                f"누적: {total_loaded:,}/{total_rows:,}행"
-            )
+            # step 2) 청크 COPY → tmp_load
+            num_chunks = (total_rows + COPY_CHUNK_SIZE - 1) // COPY_CHUNK_SIZE
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * COPY_CHUNK_SIZE
+                end   = min(start + COPY_CHUNK_SIZE, total_rows)
+                chunk_df = df.iloc[start:end]
 
-        # 모든 배치 완료 후 DB에 확정 반영
+                buffer = io.StringIO()
+                chunk_df.to_csv(buffer, index=False, header=False, na_rep="\\N")
+                buffer.seek(0)
+
+                cursor.copy_expert(
+                    f"COPY tmp_load ({col_str}) FROM STDIN "
+                    f"WITH (FORMAT csv, NULL '\\N')",
+                    buffer,
+                )
+                logger.debug(
+                    f"  COPY 청크 {chunk_idx + 1}/{num_chunks} 완료 "
+                    f"({start:,}~{end:,}행)"
+                )
+
+            # step 3) COPY 완료 후 tmp_load에 인덱스 생성
+            #   인덱스가 있어야 UPDATE의 join이 hash/merge join으로 최적화됨
+            logger.debug("  tmp_load 인덱스 생성 중...")
+            cursor.execute(f"CREATE INDEX ON tmp_load ({pk_str})")
+            logger.debug("  tmp_load 인덱스 생성 완료")
+
+            # step 4) wind 행이 이미 있는 main 테이블에 wave 컬럼만 UPDATE
+            #   INSERT ON CONFLICT DO UPDATE 대신 plain UPDATE 사용 (훨씬 빠름)
+            #   wave update_cols: [swh, mwd, mwp, shts, mdts, mpts, shww, mdww, mpww]
+            #
+            #   work_mem 증가: 24.9M × 24.9M JOIN에 hash table ~600MB 필요
+            #   기본값(64MB)이면 disk spill → 매우 느림 → 2GB로 늘려 메모리 내 처리
+            cursor.execute("SET LOCAL work_mem = '2GB'")
+            # PostgreSQL UPDATE SET 절에는 테이블 alias 불가 → 왼쪽에 컬럼명만 사용
+            set_clause  = ", ".join(f"{c} = t.{c}" for c in update_cols)
+            pk_where    = " AND ".join(f"r.{c} = t.{c}" for c in pk_cols)
+            logger.debug("  wave UPDATE main 테이블 실행 중... (work_mem=2GB)")
+            cursor.execute(f"""
+                UPDATE {target_table} r
+                SET    {set_clause}
+                FROM   tmp_load t
+                WHERE  {pk_where}
+            """)
+            total_loaded = cursor.rowcount
+
+            # step 5) 임시 테이블 정리
+            cursor.execute("DROP TABLE IF EXISTS tmp_load")
+
+        # 커밋 1회
         conn.commit()
         cursor.close()
 
         logger.success(
-            f"[적재 완료] {nc_path.name} | 총 {total_loaded:,}행"
+            f"[적재 완료] {nc_path.name} | 총 {total_loaded:,}행 적재/갱신"
         )
 
     except Exception as e:
-        # 에러 발생 시 전체 취소 (부분 적재된 것도 롤백)
         conn.rollback()
         logger.error(f"[적재 실패] {nc_path.name}: {e}")
         raise
@@ -322,7 +412,7 @@ def load_netcdf_to_db(
 
 def load_multiple_files(
     nc_paths: list[Path],
-    table_name: str,
+    table_name: str = None,
     batch_size: int = 50_000,
 ) -> dict:
     """
@@ -331,7 +421,7 @@ def load_multiple_files(
     Parameters
     ----------
     nc_paths   : list[Path]  →  적재할 파일 경로 목록
-    table_name : str         →  적재할 테이블 이름
+    table_name : str         →  적재할 테이블 이름 (None이면 파일명으로 자동 판단)
     batch_size : int         →  배치 크기
 
     Returns
@@ -359,7 +449,6 @@ def load_multiple_files(
             # 한 파일 실패해도 나머지 계속 진행
             continue
 
-    # 전체 결과 요약
     logger.info(
         f"전체 적재 완료 | 성공: {success_count}파일 | "
         f"실패: {failed_count}파일 | 총 {total_rows:,}행"

@@ -81,6 +81,31 @@ forecast_days = 5
 # ECMWF Open Data에서 수집 불가한 너울/풍파 분리 변수 9개를 여기서 보완
 forecast_days = 5
 
+[pipeline]
+# 상태 진단 시 오늘 기준 몇 일 전까지 pipeline_coverage를 스캔할지 (일)
+coverage_lookback_days = 30
+
+# ERA5 재분석 데이터 제공 지연 기본값 (일)
+# 실제 가용 여부는 다운로드 시 CDS API 응답으로 확인 — 이 값은 "최소 이 일 전부터 시도"의 기준
+era5_delay_days = 7
+
+# ERA5T(근실시간) 제공 지연 기본값 (일)
+era5t_delay_days = 3
+
+# HYCOM 분석 데이터 보유 롤링 윈도우 (일)
+# 이 기간을 초과한 missing 날짜는 영구 소실로 판정 → permanent_forecast로 승격
+hycom_window_days = 10
+
+# 적재 행 수가 기대 행 수의 이 비율(0~1) 미만이면 'partial'로 판정
+partial_threshold = 0.95
+
+# 스케줄러 실행 시각 (KST 기준, 24시간제)
+# Windows 작업 스케줄러 / Linux cron 설정 시 이 값을 참고
+schedule_hour_kst = 10
+
+# N일 이상 missing/failed 상태가 지속되면 경고 로그 출력
+alert_missing_days_threshold = 3
+
 [paths]
 # 다운로드된 NetCDF 파일 저장 위치 (ECMWF 재분석)
 ecmwf_reanalysis_dir = "data/ecmwf/reanalysis"

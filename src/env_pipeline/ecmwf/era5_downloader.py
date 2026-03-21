@@ -54,12 +54,12 @@ VARIABLES_MAP = {
 
 def load_date_range(json_path: Path) -> tuple[datetime, datetime]:
     """
-    config/down.json 에서 시작일/종료일을 읽어 반환
+    config/down.json 에서 수동 백필 날짜 범위를 읽어 반환
 
-    down.json 형식:
+    down.json 형식 (Phase 10 이후 — --manual 전용):
         {
-            "start_date": "2025-01-14",
-            "end_date":   "2025-02-14"
+            "manual_start": "2025-01-14",
+            "manual_end":   "2025-02-14"
         }
 
     Parameters
@@ -74,7 +74,7 @@ def load_date_range(json_path: Path) -> tuple[datetime, datetime]:
     if not json_path.exists():
         raise FileNotFoundError(
             f"날짜 설정 파일이 없습니다: {json_path}\n"
-            f"config/down.json 파일에 start_date, end_date를 입력해주세요."
+            f"config/down.json 파일에 manual_start, manual_end를 입력해주세요."
         )
 
     # JSON 파일 읽기
@@ -82,22 +82,22 @@ def load_date_range(json_path: Path) -> tuple[datetime, datetime]:
         config = json.load(f)
 
     # 날짜 문자열 → datetime 변환 (UTC 타임존 적용)
-    start_date = datetime.strptime(config["start_date"], "%Y-%m-%d").replace(
+    start_date = datetime.strptime(config["manual_start"], "%Y-%m-%d").replace(
         tzinfo=timezone.utc
     )
-    end_date = datetime.strptime(config["end_date"], "%Y-%m-%d").replace(
+    end_date = datetime.strptime(config["manual_end"], "%Y-%m-%d").replace(
         tzinfo=timezone.utc
     )
 
     # 날짜 범위 유효성 검사
     if start_date > end_date:
         raise ValueError(
-            f"start_date({config['start_date']})가 "
-            f"end_date({config['end_date']})보다 늦습니다."
+            f"manual_start({config['manual_start']})가 "
+            f"manual_end({config['manual_end']})보다 늦습니다."
         )
 
     logger.info(
-        f"날짜 범위 로드: {config['start_date']} ~ {config['end_date']} "
+        f"수동 날짜 범위 로드: {config['manual_start']} ~ {config['manual_end']} "
         f"({(end_date - start_date).days + 1}일)"
     )
     return start_date, end_date
@@ -283,32 +283,54 @@ class ERA5Downloader:
                 output_path.unlink()
             return None
 
-    def run(self, json_path: Path, resolution: float) -> list[Path]:
+    def run(
+        self,
+        json_path: Path | None = None,
+        resolution: float = 0.25,
+        date_list: list[datetime] | None = None,
+    ) -> list[Path]:
         """
-        down.json을 읽어 전체 날짜 범위의 wind + wave 다운로드 실행
+        전체 날짜 범위의 wind + wave 다운로드 실행
+
+        두 가지 날짜 입력 방식을 지원:
+          1. date_list 직접 전달  →  자동 모드 (pipeline.py에서 coverage 기반 날짜 전달)
+          2. json_path 지정       →  수동 모드 (--manual 플래그, down.json 날짜 범위 사용)
 
         Parameters
         ----------
-        json_path  : Path   →  config/down.json 경로
-        resolution : float  →  공간 해상도
+        json_path  : Path | None          →  config/down.json 경로 (수동 모드)
+        resolution : float                →  공간 해상도 (기본 0.25°)
+        date_list  : list[datetime] | None →  직접 전달할 날짜 목록 (자동 모드)
 
         Returns
         -------
         list[Path]  →  성공적으로 다운로드된 파일 경로 목록
         """
-        # JSON에서 시작일/종료일 로드
-        start_date, end_date = load_date_range(json_path)
+        # ── 날짜 목록 결정 ──
+        if date_list is not None:
+            # 자동 모드: pipeline.py 에서 coverage 기반으로 선별된 날짜 목록 직접 수신
+            dates = date_list
+            logger.info(f"자동 모드: {len(dates)}일치 ECMWF 재분석 다운로드 시작")
+        elif json_path is not None:
+            # 수동 모드: down.json 의 manual_start/manual_end 범위 사용
+            start_date, end_date = load_date_range(json_path)
+            total = (end_date - start_date).days + 1
+            dates = [start_date + timedelta(days=i) for i in range(total)]
+            logger.info(f"수동 모드: {total}일치 ECMWF 재분석 다운로드 시작")
+        else:
+            raise ValueError(
+                "json_path 또는 date_list 중 하나는 반드시 지정해야 합니다.\n"
+                "  자동 모드: ERA5Downloader.run(date_list=[...])\n"
+                "  수동 모드: ERA5Downloader.run(json_path=Path('config/down.json'))"
+            )
 
-        total_days    = (end_date - start_date).days + 1
-        downloaded    = []   # 성공한 파일 경로 누적
-        current_date  = start_date
-        day_index     = 0
+        total_days = len(dates)
+        downloaded = []   # 성공한 파일 경로 누적
 
         logger.info(f"총 {total_days}일 × 2종류(wind, wave) = {total_days * 2}개 파일 예정")
 
-        # 날짜 반복: 시작일부터 종료일까지 하루씩
-        while current_date <= end_date:
-            day_index += 1
+        # 날짜 반복 (하루씩)
+        for day_index, current_date in enumerate(dates, start=1):
             logger.info(f"[{day_index}/{total_days}일] {current_date.strftime('%Y-%m-%d')}")
 
             # wind와 wave 순서대로 다운로드
@@ -316,9 +338,6 @@ class ERA5Downloader:
                 path = self.download_day(current_date, data_type, resolution)
                 if path is not None:
                     downloaded.append(path)
-
-            # 다음 날짜로 이동
-            current_date += timedelta(days=1)
 
         # 최종 결과 요약
         expected = total_days * 2  # wind + wave 각 1파일씩

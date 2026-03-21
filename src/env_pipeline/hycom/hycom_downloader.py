@@ -245,39 +245,57 @@ class HYCOMDownloader:
                 pass
             return None
 
-    def run(self, json_path: Path) -> list[Path]:
+    def run(
+        self,
+        json_path: Path | None = None,
+        date_list: list[datetime] | None = None,
+    ) -> list[Path]:
         """
-        down.json을 읽어 전체 날짜 범위의 해류 데이터 다운로드
+        전체 날짜 범위의 해류 데이터 다운로드
+
+        두 가지 날짜 입력 방식을 지원:
+          1. date_list 직접 전달  →  자동 모드 (pipeline.py에서 coverage 기반 날짜 전달)
+          2. json_path 지정       →  수동 모드 (--manual 플래그, down.json 날짜 범위 사용)
 
         Parameters
         ----------
-        json_path : Path  →  config/down.json 경로
+        json_path : Path | None           →  config/down.json 경로 (수동 모드)
+        date_list : list[datetime] | None  →  직접 전달할 날짜 목록 (자동 모드)
 
         Returns
         -------
         list[Path]  →  성공적으로 다운로드된 파일 경로 목록
         """
-        # JSON에서 시작일/종료일 로드 (ECMWF와 동일한 함수 사용)
-        start_date, end_date = load_date_range(json_path)
+        # ── 날짜 목록 결정 ──
+        if date_list is not None:
+            # 자동 모드: pipeline.py 에서 coverage 기반으로 선별된 날짜 목록 직접 수신
+            dates = date_list
+            logger.info(f"자동 모드: {len(dates)}일치 HYCOM 해류 다운로드 시작")
+        elif json_path is not None:
+            # 수동 모드: down.json 의 manual_start/manual_end 범위 사용
+            start_date, end_date = load_date_range(json_path)
+            total = (end_date - start_date).days + 1
+            dates = [start_date + timedelta(days=i) for i in range(total)]
+            logger.info(f"수동 모드: {total}일치 HYCOM 해류 다운로드 시작")
+        else:
+            raise ValueError(
+                "json_path 또는 date_list 중 하나는 반드시 지정해야 합니다.\n"
+                "  자동 모드: HYCOMDownloader.run(date_list=[...])\n"
+                "  수동 모드: HYCOMDownloader.run(json_path=Path('config/down.json'))"
+            )
 
-        total_days   = (end_date - start_date).days + 1
-        downloaded   = []
-        current_date = start_date
-        day_index    = 0
+        total_days = len(dates)
+        downloaded = []
 
         logger.info(f"HYCOM 다운로드 시작 | 총 {total_days}일")
 
-        # 날짜 반복: 시작일부터 종료일까지 하루씩
-        while current_date <= end_date:
-            day_index += 1
+        # 날짜 반복 (하루씩)
+        for day_index, current_date in enumerate(dates, start=1):
             logger.info(f"[{day_index}/{total_days}일] {current_date.strftime('%Y-%m-%d')}")
 
             path = self.download_day(current_date)
             if path is not None:
                 downloaded.append(path)
-
-            # 다음 날짜로 이동
-            current_date += timedelta(days=1)
 
         logger.info(
             f"HYCOM 다운로드 완료 | 성공: {len(downloaded)}/{total_days}개 파일"
