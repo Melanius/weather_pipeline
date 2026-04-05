@@ -184,7 +184,7 @@ def get_forecast_horizon() -> dict:
     return result
 
 
-def get_coverage(days: int = 14) -> pd.DataFrame:
+def get_coverage(days: int = 30) -> pd.DataFrame:
     """pipeline_coverage 최근 N일 조회"""
     start = date.today() - timedelta(days=days - 1)
     return _fetch_df(
@@ -196,6 +196,33 @@ def get_coverage(days: int = 14) -> pd.DataFrame:
         """,
         (start,),
     )
+
+
+def get_forecast_dates() -> dict[str, set]:
+    """예보 테이블별 실제 존재하는 날짜 집합 반환 (미래 날짜 달력용)"""
+    mapping = {
+        "Wind 예보":    "env_ecmwf_forecast",
+        "Wave 예보":    "env_noaa_forecast",
+        "Current 예보": "env_hycom_forecast",
+    }
+    result = {}
+    conn = _get_conn()
+    if conn is None:
+        return {k: set() for k in mapping}
+    try:
+        for col_name, table in mapping.items():
+            cur = conn.cursor()
+            # 오늘 이후 날짜만 조회 (미래 행만 필요)
+            cur.execute(
+                f"SELECT DISTINCT DATE(datetime AT TIME ZONE 'UTC') FROM {table} "
+                f"WHERE datetime > %s",
+                (date.today(),),
+            )
+            result[col_name] = {row[0] for row in cur.fetchall()}
+            cur.close()
+    finally:
+        conn.close()
+    return result
 
 
 def get_missing_count() -> int:
@@ -290,7 +317,7 @@ def get_last_run_info() -> dict:
 def style_coverage_pivot(pivot: pd.DataFrame) -> pd.DataFrame:
     """커버리지 피벗 테이블: 상태값 → 이모지로 변환"""
     return pivot.map(
-        lambda v: STATUS_EMOJI.get(str(v), str(v)) if pd.notna(v) else "—"
+        lambda v: STATUS_EMOJI.get(str(v), str(v)) if pd.notna(v) and str(v) != "—" else "—"
     )
 
 
@@ -418,15 +445,22 @@ def main():
     st.divider()
 
     # ── 섹션 3: 데이터 커버리지 달력 ────────────────
-    st.subheader("📅 데이터 커버리지 달력 (최근 14일)")
+    st.subheader("📅 데이터 커버리지 달력")
 
-    cov_df = get_coverage(days=14)
+    # 기본 30일, "더 보기" 버튼으로 30일씩 추가
+    if "cov_days" not in st.session_state:
+        st.session_state.cov_days = 30
 
-    # 최근 14일 날짜 목록 생성 (데이터 유무와 무관하게 모든 날짜 표시)
+    cov_df = get_coverage(days=st.session_state.cov_days)
+
+    # 날짜 범위: 과거 N일 + 미래 10일 (ECMWF 예보 최대 10일)
     today = date.today()
-    all_dates = [today - timedelta(days=i) for i in range(14)]
+    future_days = 10   # ECMWF 최대 예보 기간
+    past_dates   = [today - timedelta(days=i) for i in range(st.session_state.cov_days)]
+    future_dates = [today + timedelta(days=i) for i in range(1, future_days + 1)]
+    all_dates = future_dates[::-1] + past_dates   # 미래(위) → 과거(아래) 순
 
-    # ecmwf_reanalysis → Wind 재분석 / Wave 재분석 두 컬럼으로 분리
+    # ── 과거 날짜: pipeline_coverage 데이터 반영 ──
     expanded_rows = []
     if not cov_df.empty:
         for _, row in cov_df.iterrows():
@@ -438,17 +472,29 @@ def main():
                     "status": row["status"],
                 })
 
-    # 6개 컬럼 × 14일을 "missing"으로 초기화한 뒤 실제 데이터로 덮어쓰기
+    # ── 미래 날짜: 예보 테이블에서 날짜별 존재 여부 조회 ──
+    forecast_dates = get_forecast_dates()
+    REANALYSIS_COLS = {"Wind 재분석", "Wave 재분석", "Current 재분석"}
+    for future_d in future_dates:
+        for col in COVERAGE_COLUMN_ORDER:
+            if col in REANALYSIS_COLS:
+                # 재분석은 미래 데이터 없음 → 빈 칸으로 표시
+                expanded_rows.append({"date": future_d, "source": col, "status": "—"})
+            else:
+                # 예보 테이블에 해당 날짜 데이터 있으면 forecast_only, 없으면 missing
+                status = "forecast_only" if future_d in forecast_dates.get(col, set()) else "missing"
+                expanded_rows.append({"date": future_d, "source": col, "status": status})
+
+    # 전체 날짜 × 6컬럼 베이스 (과거는 missing, 미래는 위에서 채움)
     base_rows = [
         {"date": d, "source": col, "status": "missing"}
-        for d in all_dates
+        for d in past_dates
         for col in COVERAGE_COLUMN_ORDER
     ]
     base_df = pd.DataFrame(base_rows)
 
     if expanded_rows:
         actual_df = pd.DataFrame(expanded_rows)
-        # 실제 데이터 병합 (실제 값이 있으면 "missing" 덮어쓰기)
         base_df = base_df.merge(
             actual_df.rename(columns={"status": "actual_status"}),
             on=["date", "source"],
@@ -457,15 +503,36 @@ def main():
         base_df["status"] = base_df["actual_status"].combine_first(base_df["status"])
         base_df = base_df[["date", "source", "status"]]
 
+    # 미래 날짜 행 추가
+    future_rows = [
+        {"date": d, "source": col,
+         "status": next((r["status"] for r in expanded_rows if r["date"] == d and r["source"] == col), "missing")}
+        for d in future_dates
+        for col in COVERAGE_COLUMN_ORDER
+    ]
+    full_df = pd.concat([pd.DataFrame(future_rows), base_df], ignore_index=True)
+
     # 피벗: 날짜(행) × 소스(열), 최신 날짜 상단
-    pivot = base_df.pivot_table(
+    pivot = full_df.pivot_table(
         index="date", columns="source", values="status", aggfunc="first"
     ).sort_index(ascending=False)
 
     # 컬럼 순서 고정 (항상 6개 컬럼)
     pivot = pivot[COVERAGE_COLUMN_ORDER]
 
+    st.caption(f"🔵 미래 10일(예보) + 과거 {st.session_state.cov_days}일(재분석) 표시 중")
     st.dataframe(style_coverage_pivot(pivot), use_container_width=True)
+
+    # 더 보기 버튼 (30일씩 추가)
+    col_more, col_reset, _ = st.columns([1, 1, 8])
+    with col_more:
+        if st.button("📂 30일 더 보기"):
+            st.session_state.cov_days += 30
+            st.rerun()
+    with col_reset:
+        if st.session_state.cov_days > 30 and st.button("🔼 초기화 (30일)"):
+            st.session_state.cov_days = 30
+            st.rerun()
 
     # 범례
     legend_cols = st.columns(len(STATUS_EMOJI))
