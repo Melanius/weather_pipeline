@@ -28,6 +28,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     # 로그 출력 (loguru는 기본 logging보다 사용하기 편함)
     "loguru>=0.7.0",
+    # 모니터링 대시보드 (monitoring/app.py)
+    "streamlit>=1.35.0",
 ]
 
 [build-system]

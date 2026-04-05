@@ -1,6 +1,6 @@
 """
-파이프라인 상태 추적 모듈 (Phase 10)
-======================================
+파이프라인 상태 추적 모듈 (Phase 10, Phase 14-A 개선)
+======================================================
 
 pipeline_coverage 테이블을 읽고 쓰는 모든 함수를 담당.
 
@@ -18,6 +18,11 @@ pipeline_coverage 테이블을 읽고 쓰는 모든 함수를 담당.
   'permanent_forecast' → HYCOM 롤링 윈도우 초과 → 예보가 영구 확정 (cleanup 제외)
   'missing'            → 어떤 데이터도 없음
   'failed'             → 다운로드/적재 시도 중 오류 발생
+
+Phase 14-A 변경:
+  - 완료 판정 기준을 '행 수 >= expected × threshold' 에서 '예외 없음' 으로 변경.
+  - 해양 필터링·HYCOM 격자 수는 날짜·설정에 따라 달라지므로 고정 expected_rows 비교는 부정확.
+  - EXPECTED_ROWS 상수 제거. expected_rows 컬럼은 NULL로 유지 (DB 컬럼 자체는 보존).
 """
 
 from __future__ import annotations
@@ -66,28 +71,6 @@ FORECAST_SOURCE_TO_TABLE = {
 }
 
 # ─────────────────────────────────────────────────────
-# 예상 행 수 (소스별 — partial 판정 기준)
-# 기준: 전 지구 격자 × 일별 시간 스텝
-# ─────────────────────────────────────────────────────
-# ECMWF 재분석 wind/wave: 24시간 × 721lat × 1440lon = 24,917,760 rows / day
-# HYCOM current (stride=3): 8스텝 × ~1001lat × ~1501lon ≈ 12,008,008 rows / day
-# NOAA forecast: 48시간 × 311lat × 720lon = 10,730,880 rows / day
-# ECMWF forecast: 40스텝(6h간격×10일) × 721 × 1440 = 41,529,600 rows / issued_at
-# HYCOM forecast: 40스텝 × ~1001 × ~1501 ≈ 60,040,040 rows / issued_at
-#
-# NOTE: 재분석 파일은 wind/wave 두 파일이 같은 테이블에 적재되므로
-#       하루 총 expected_rows = wind expected + wave expected = 49,835,520
-#       (그러나 ON CONFLICT DO UPDATE로 중복없이 행이 유지됨 → 실제 행수는 1세트)
-EXPECTED_ROWS = {
-    SOURCE_ECMWF_REANALYSIS: 24_917_760,  # 하루 1파일 기준 (wind 또는 wave 각각)
-    SOURCE_HYCOM_CURRENT:    12_008_008,
-    SOURCE_ECMWF_FORECAST:   41_529_600,
-    SOURCE_NOAA_FORECAST:    10_730_880,
-    SOURCE_HYCOM_FORECAST:   60_040_040,
-}
-
-
-# ─────────────────────────────────────────────────────
 # 상태 갱신 함수
 # ─────────────────────────────────────────────────────
 
@@ -116,22 +99,20 @@ def update_coverage(
     data_type   : 'era5' 또는 'era5t' (재분석 품질 구분, None이면 갱신 안 함)
     notes       : 부가 메모 (예: "HYCOM window expired")
     """
-    # expected_rows는 소스별 상수에서 조회
-    expected_rows = EXPECTED_ROWS.get(source)
 
     cursor = conn.cursor()
     # INSERT ON CONFLICT DO UPDATE 방식
     # 이미 있으면 status, loaded_at 등 갱신
+    # expected_rows 는 NULL로 저장 (Phase 14-A: 행 수 비교 판정 제거)
     cursor.execute("""
         INSERT INTO pipeline_coverage
             (date, source, status, data_type, row_count, expected_rows, loaded_at, notes)
         VALUES
-            (%s, %s, %s, %s, %s, %s, NOW() AT TIME ZONE 'UTC', %s)
+            (%s, %s, %s, %s, %s, NULL, NOW() AT TIME ZONE 'UTC', %s)
         ON CONFLICT (date, source) DO UPDATE SET
             status        = EXCLUDED.status,
             data_type     = COALESCE(EXCLUDED.data_type, pipeline_coverage.data_type),
             row_count     = COALESCE(EXCLUDED.row_count, pipeline_coverage.row_count),
-            expected_rows = COALESCE(EXCLUDED.expected_rows, pipeline_coverage.expected_rows),
             loaded_at     = EXCLUDED.loaded_at,
             notes         = COALESCE(EXCLUDED.notes, pipeline_coverage.notes)
     """, (
@@ -140,7 +121,6 @@ def update_coverage(
         status,
         data_type,
         row_count,
-        expected_rows,
         notes,
     ))
     # 호출자가 conn.commit() 책임 (트랜잭션 제어권 유지)
@@ -155,30 +135,46 @@ def get_backfill_dates(
     today: date,
     lookback_days: int,
     era5_delay_days: int,
+    reanalysis_start_date: date | None = None,
 ) -> dict[str, list[date]]:
     """
     백필이 필요한 날짜 목록을 소스별로 반환
 
     스캔 범위:
-      - ECMWF 재분석: [today - lookback_days, today - era5_delay_days]
+      - ECMWF 재분석: [range_start, today - era5_delay_days]
         (era5_delay_days 이내는 아직 API 미제공이므로 시도하지 않음)
       - HYCOM 분석: 동일 범위 (HYCOM은 보통 당일~1일 지연 제공)
+
+    range_start 결정 규칙:
+      max(today - lookback_days, reanalysis_start_date)
+      → 두 날짜 중 더 최근 날짜 사용 (하한선 적용)
+      → reanalysis_start_date 이전 날짜는 절대 수집하지 않음
 
     'complete' 또는 'permanent_forecast' 상태는 백필 불필요로 제외.
 
     Parameters
     ----------
-    conn            : psycopg2 연결 객체
-    today           : 기준 날짜 (--simulate-date 지원)
-    lookback_days   : 스캔할 과거 기간 (일)
-    era5_delay_days : ERA5 API 안전 지연 일수
+    conn                   : psycopg2 연결 객체
+    today                  : 기준 날짜 (--simulate-date 지원)
+    lookback_days          : 스캔할 과거 기간 (일)
+    era5_delay_days        : ERA5 API 안전 지연 일수
+    reanalysis_start_date  : 재분석 수집 최초 시작일 (고정 하한선, None이면 미적용)
 
     Returns
     -------
     dict: {source: [date, ...]} — 소스별 백필 필요 날짜 목록
     """
     # 스캔 범위 계산
-    range_start = today - timedelta(days=lookback_days)
+    rolling_start = today - timedelta(days=lookback_days)
+
+    # reanalysis_start_date가 설정된 경우: 두 날짜 중 더 최근 날짜를 하한선으로 사용
+    # 예) rolling_start=3/6, start_date=3/29 → max → 3/29 (3/29 이전은 수집 안 함)
+    # 예) rolling_start=5/2, start_date=3/29 → max → 5/2  (롤링이 더 최근이면 그대로)
+    if reanalysis_start_date is not None:
+        range_start = max(rolling_start, reanalysis_start_date)
+    else:
+        range_start = rolling_start
+
     range_end   = today - timedelta(days=era5_delay_days)
 
     if range_start > range_end:

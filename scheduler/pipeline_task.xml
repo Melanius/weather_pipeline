@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  llm_for_ship 환경 데이터 파이프라인 — Windows Task Scheduler 등록 파일
+
+  등록 방법 (PowerShell 관리자 권한):
+    schtasks /Create /XML "C:\Users\hjlee\llm_for_ship\scheduler\pipeline_task.xml" /TN "llm_for_ship_pipeline"
+
+  삭제 방법:
+    schtasks /Delete /TN "llm_for_ship_pipeline" /F
+
+  수동 실행:
+    schtasks /Run /TN "llm_for_ship_pipeline"
+
+  실행 로그 확인:
+    - Windows 이벤트 뷰어 → 작업 스케줄러 로그
+    - 파이프라인 로그: C:\Users\hjlee\llm_for_ship\logs\pipeline_YYYY-MM-DD.log
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+
+  <RegistrationInfo>
+    <Description>
+      llm_for_ship 환경 데이터 수집 파이프라인.
+      매일 10:00 KST에 ECMWF 재분석 + HYCOM 분석 + 예보 3종을 수집하여 TimescaleDB에 적재.
+    </Description>
+    <Author>hjlee</Author>
+  </RegistrationInfo>
+
+  <Triggers>
+    <!-- 매일 10:00 KST(= 01:00 UTC) 실행 -->
+    <!-- Windows 작업 스케줄러는 로컬 시각 기준이므로 10:00으로 설정 -->
+    <CalendarTrigger>
+      <StartBoundary>2026-04-06T10:00:00</StartBoundary>
+      <ExecutionTimeLimit>PT3H</ExecutionTimeLimit>  <!-- 최대 3시간 실행 허용 -->
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>  <!-- 매일 반복 -->
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+
+  <Principals>
+    <Principal id="Author">
+      <!-- 현재 사용자 권한으로 실행 (로그인 여부 무관하게 실행) -->
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>  <!-- 이미 실행 중이면 새 실행 무시 -->
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>  <!-- 예약 시각에 PC가 꺼져있었으면 켜지는 즉시 실행 -->
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>  <!-- 네트워크 연결 시에만 실행 -->
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT3H</ExecutionTimeLimit>  <!-- 최대 실행 시간 3시간 -->
+    <Priority>7</Priority>
+
+    <!-- 실패 시 재시도 설정 -->
+    <RestartOnFailure>
+      <Interval>PT1H</Interval>   <!-- 1시간 후 재시도 -->
+      <Count>1</Count>            <!-- 최대 1회 재시도 -->
+    </RestartOnFailure>
+  </Settings>
+
+  <Actions Context="Author">
+    <Exec>
+      <!-- run_pipeline.bat 실행 -->
+      <Command>C:\Users\hjlee\llm_for_ship\scheduler\run_pipeline.bat</Command>
+      <WorkingDirectory>C:\Users\hjlee\llm_for_ship</WorkingDirectory>
+    </Exec>
+  </Actions>
+
+</Task>

@@ -188,7 +188,10 @@ class NOAAForecastDownloader:
             # ── 2단계: 예보 시간 범위 선택 ──
             # PacIOOS WW3는 "time" 좌표 사용 (ERDDAP 표준)
             day_start = forecast_start.strftime("%Y-%m-%dT00:00:00")
-            day_end   = forecast_end.strftime("%Y-%m-%dT23:59:59")
+            # forecast_end = issued_at + N일 = "N+1일째 자정(00:00)"
+            # 여기서 1초를 빼면 "N일째 23:59:59" → 정확히 N일치만 선택됨
+            # (1초를 빼지 않으면 N+1일째 23:59:59까지 포함되어 1일 초과)
+            day_end   = (forecast_end - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S")
 
             # 9개 변수를 시간 범위로 선택 (공간은 전체)
             ds_fc = ds[NOAA_VARIABLES].sel(
@@ -279,8 +282,20 @@ class NOAAForecastDownloader:
             ds_fc.attrs["source"]        = "NOAA WaveWatch III (PacIOOS)"
             ds_fc.attrs["wave_params"]   = list(VARIABLE_RENAME.values())  # swh, mwd, ...
 
-            # ── 7단계: NetCDF 파일로 저장 ──
-            ds_fc.to_netcdf(str(output_path))
+            # ── 7단계: float32 변환 + zlib 압축 후 NetCDF 파일로 저장 ──
+            # 다운로드된 데이터는 float64 기본값 → 파일 크기 과다
+            # float32 변환 + zlib 압축으로 파일 크기를 크게 줄임
+            for var in list(ds_fc.data_vars):
+                if ds_fc[var].dtype == "float64":
+                    # float64 → float32 변환 (attrs 보존)
+                    ds_fc[var] = ds_fc[var].astype("float32")
+
+            # zlib 압축 인코딩 (complevel=4: 속도·압축률 균형)
+            encoding = {
+                var: {"zlib": True, "complevel": 4, "dtype": "float32"}
+                for var in ds_fc.data_vars
+            }
+            ds_fc.to_netcdf(str(output_path), encoding=encoding)
             ds.close()   # 원격 OPeNDAP 연결 닫기
 
             size_mb = output_path.stat().st_size / (1024 * 1024)

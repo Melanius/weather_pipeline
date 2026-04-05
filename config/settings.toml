@@ -82,6 +82,12 @@ forecast_days = 5
 forecast_days = 5
 
 [pipeline]
+# 재분석 수집 최초 시작일 (고정 하한선)
+# lookback_days로 계산한 날짜가 이 날짜보다 이전이면 이 날짜를 range_start로 사용
+# 예: 오늘이 2026-06-01, lookback=30 → 2026-05-02 vs 2026-03-29 → max → 2026-05-02
+# 예: 오늘이 2026-04-05, lookback=30 → 2026-03-06 vs 2026-03-29 → max → 2026-03-29
+reanalysis_start_date = "2026-03-29"
+
 # 상태 진단 시 오늘 기준 몇 일 전까지 pipeline_coverage를 스캔할지 (일)
 coverage_lookback_days = 30
 

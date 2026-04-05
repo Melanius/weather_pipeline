@@ -2,6 +2,6 @@
     "_comment": "auto 모드에서는 이 파일을 사용하지 않음. --manual 플래그와 함께 사용하는 수동 백필 전용.",
     "_comment2": "수동 백필 시 manual_start/manual_end 를 설정하고 --manual 옵션으로 실행.",
     "_comment3": "ERA5 지연 특성상 manual_end 는 오늘 기준 -7일 이전으로 설정 권장.",
-    "manual_start": "2026-03-05",
-    "manual_end":   "2026-03-12"
+    "manual_start": "2026-03-30",
+    "manual_end":   "2026-03-30"
 }

@@ -4,7 +4,7 @@
 > **담당자**: 이훈정 책임 (한화오션)
 > **담당 범위**: 환경 데이터 수집 → PostgreSQL(TimescaleDB) 적재 파이프라인
 > **작업 환경**: Windows 11 + WSL2 (Ubuntu) / Python 3.12 / UV / Docker Desktop
-> **최초 작성일**: 2026-03-15 (KST) | **최종 수정일**: 2026-03-21 (KST, Phase 11 완료)
+> **최초 작성일**: 2026-03-15 (KST) | **최종 수정일**: 2026-04-05 (KST, Phase 14~15-B 완료 + 재분석 백필 완료)
 
 ---
 
@@ -37,7 +37,7 @@
 | 파랑 (Wave) | ECMWF ERA5/ERA5T (CDS API) | swh, mwd, mwp, shts, mdts, mpts, shww, mdww, mpww | 0.25° | 1시간 |
 | 해류 (Current) | HYCOM 분석 OPeNDAP | water_u, water_v | ~0.24° (stride=3) | 3시간 |
 
-### 1-2. 수집 데이터 종류 — 예보(미래) ✅ 개발 완료 (DB 적재 테스트 미완료)
+### 1-2. 수집 데이터 종류 — 예보(미래) ✅ 완료 (개발 + DB 적재 테스트 완료)
 
 | 데이터 | 출처 | 변수 | 해상도 | 예보 기간 |
 |--------|------|------|--------|----------|
@@ -574,7 +574,7 @@ CREATE TABLE env_hycom_current (
 -- Hypertable: 7일 청크 / 30일 후 자동 압축
 ```
 
-### 7-2. 추가된 테이블 (예보) ✅ 구현 완료 (DB 적재 테스트 미완료)
+### 7-2. 추가된 테이블 (예보) ✅ 완료
 
 ```sql
 -- ECMWF 예보 (바람만 — ✅ Phase 9에서 파랑 컬럼 완전 제거 2026-03-17)
@@ -631,7 +631,7 @@ uv run python run.py --mode load_only         # DB 적재만
 uv run python run.py --mode full              # 다운로드 + 적재
 ```
 
-### 8-2. 예보 파이프라인 (✅ 다운로드 완료, DB 적재 테스트 미완료)
+### 8-2. 예보 파이프라인 ✅ 완료
 ```bash
 # 예보 다운로드만 (ECMWF + HYCOM + NOAA WW3)
 uv run python run.py --mode forecast_download_only
@@ -700,42 +700,203 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
   - Strategy B (COPY→UPDATE, work_mem=2GB): wave 21.9분 ✅
 - [x] 2026-03-05 1일치 wind+wave 적재 완료 (24,917,760행, 7.2GB)
 
-### ⭐ 즉시 (다음 작업)
+### ✅ 완료된 즉시 작업 (Phase 12, 2026-04-04)
 
-#### Step 5-1. 나머지 8일치 백필 (`--manual`, 2026-03-05~12)
-- [ ] `uv run python run.py --mode load_only --manual` 실행
-  - wind × 8일 + wave × 8일 (2026-03-05는 이미 완료, 2026-03-06~12 남음)
-  - hycom current × ? 일치
-  - 예상 소요: wind 7일 × 10.7분 + wave 8일 × 21.9분 ≈ 3~4시간 (이미 적재된 3/5 제외)
-- [ ] 적재 후 `SELECT COUNT(*), MIN(datetime), MAX(datetime) FROM env_ecmwf_reanalysis` 로 범위 확인
+#### Phase 10 재확인 (코드 선행 구현 확인)
+- [x] `db/coverage.py`, `schema.py`, `run.py`, `pipeline.py` 모두 이전 세션에 선행 구현 완료 확인
+  - pipeline_coverage 테이블 / `--diagnose` / `--dry-run` / `--manual` / `--simulate-date` 전부 완료
 
-#### Step 5-2. 예보 파이프라인 DB 적재 테스트
-- [ ] `uv run python run.py --mode forecast` → 예보 DB 적재 확인 (ECMWF 바람 + HYCOM + NOAA)
+#### Phase 12 — Wind 해양 격자 필터링 (2026-04-04)
 
-#### Step 6. Phase 10 → Phase 12 — 파이프라인 상태 관리 시스템 개발
-> **상세 설계**: `specs/pipeline_state_management.md` 참조
+**배경:**
+- ERA5 Wind(u10/v10)는 전 지구 격자(육지+바다) 모두에 값이 존재 → 24.9M행 전체 적재됨
+- 선박은 바다에서만 운항 → 육지 격자 불필요 → DB 용량 약 44% 절감 가능
+- Wave(swh 등)는 육지 격자에 NaN → 해양 마스크로 활용 가능
 
-- [ ] **Phase 10-A**: `pipeline_coverage` 테이블 스키마 추가 + `--init-db` 연동
-- [ ] **Phase 10-B**: `src/env_pipeline/db/coverage.py` 신규 모듈 (상태 진단 엔진)
-  - CDS API 실제 가용 날짜 조회 (고정 -7일 폐기)
-  - HYCOM 롤링 윈도우 범위 확인
-- [ ] **Phase 10-C**: Cleanup + UPSERT 로직
-  - `cleanup_superseded_forecasts()`: 재분석 적재 완료 날짜 예보 DELETE
-  - ERA5T → ERA5 UPSERT 전환
-  - HYCOM 윈도우 초과 → permanent_forecast 승격
-- [ ] **Phase 10-D**: CLI 옵션 확장
-  - `--diagnose`: 현재 coverage 상태 출력
-  - `--simulate-date YYYY-MM-DD`: 테스트용 "오늘" 주입
-  - `--dry-run`: 실행 계획만 출력 (DB 변경 없음)
-  - `--manual`: down.json 기반 수동 백필
-- [ ] **Phase 10-E**: `settings.toml`에 `[pipeline]` 섹션 추가
-- [ ] **Phase 10-F**: 스케줄러 설정 (Windows 작업 스케줄러 + Linux cron 가이드)
+**구현 내용:**
+- [x] `src/env_pipeline/db/loader.py`에 **단계 3.6** 추가 (`ecmwf_wind` 전용 해양 필터링)
+  - 같은 날짜의 `ecmwf_wave_YYYYMMDD.nc`에서 `swh` 변수의 NaN 아닌 격자 = 해양으로 판단
+  - wave 파일 없으면 경고 출력 후 필터링 건너뜀 (안전 장치)
+  - float32 타입 통일 후 inner join으로 해양 격자만 필터링
+- [x] `scripts/test_wind_ocean_filter.py` 신규 (DB 없이 필터링 로직만 검증)
+
+**테스트 결과 (2026-03-05 기준):**
+```
+필터링 전: 24,917,760행 (전 지구)
+필터링 후: 13,883,064행 (해양만)
+제거된 행: 11,034,696행 (육지, 44.3%)
+u10/v10 NaN: 0건 ✅
+해양 비율: 55.7% (wave 파일 기준과 일치)
+```
+
+**결정 사항:**
+- 2026-03-05 기존 적재 데이터(24.9M행, 육지 포함)는 **그대로 유지** (재적재 안 함)
+- 2026-03-06 이후 신규 적재분부터 해양 필터링 적용
+
+### ✅ 완료된 즉시 작업 (Phase 13, 2026-04-04)
+
+#### Step 6. HYCOM 해류 DB 적재 테스트 ✅
+
+- [x] Docker Desktop + TimescaleDB 컨테이너 기동 확인
+- [x] `config/down.json` → `manual_start/manual_end = "2026-03-30"` 설정
+- [x] `--mode download_only --manual`: `hycom_current_20260330.nc` 다운로드 완료 (129.8 MB, 8스텝)
+  - ECMWF `ecmwf_wind_20260330.nc` (4.0 MB), `ecmwf_wave_20260330.nc` (8.7 MB)도 함께 다운로드됨
+- [x] **`load_hycom_only` 모드 신규 추가** (Phase 13): HYCOM 해류만 단독 DB 적재
+  - `pipeline.py`: `load_hycom_only` 분기 추가 (ecmwf_dates=[], hycom_dates만 처리)
+  - `run.py`: `--mode choices`에 `"load_hycom_only"` 추가
+- [x] `--mode load_hycom_only --manual`: `hycom_current_20260330.nc` DB 적재 완료
+  - 소요: **6분** (11:20→11:26)
+- [x] 적재 결과 확인:
+  ```
+  count=17,004,000 | MIN=2026-03-30 00:00 UTC | MAX=2026-03-30 21:00 UTC ✅
+  ```
+
+**신규 실행 명령:**
+```bash
+# HYCOM 해류만 단독 적재 (ECMWF 건너뜀)
+uv run python run.py --mode load_hycom_only --manual
+# --manual 없으면 data/hycom/current/ 전체 파일 스캔
+uv run python run.py --mode load_hycom_only
+```
+
+### ✅ 완료된 작업 (Phase 14, 2026-04-05)
+
+#### Phase 14-A: 완료 판정 기준 변경 ✅
+- [x] `db/coverage.py`에서 `EXPECTED_ROWS` 행 수 비교 방식 제거
+- [x] 에러 없음 = `complete`, 예외 발생 시 `failed` 판정으로 변경
+- [x] `EXPECTED_ROWS` 상수 전체 삭제
+
+#### Phase 14-B: 예보 테이블 PK 재설계 ✅
+- [x] 3개 예보 테이블 PK: `(issued_at, datetime, lat, lon)` → `(datetime, lat, lon)`
+- [x] `issued_at` 일반 컬럼으로 유지 (정보용)
+- [x] `reinit_forecast_tables()` 함수 추가, `--reinit-forecast` 플래그 추가
+- [x] `run.py --reinit-forecast`로 스키마 마이그레이션 실행 완료
+
+#### Phase 14-C: 예보 pipeline_coverage 기록 추가 ✅
+- [x] `pipeline.py`의 예보 파이프라인 완료 시 소스별 `forecast_only` 상태 기록
+- [x] 예보 적재 실패 시 `failed` 기록
+
+#### Phase 14-D: 예보 파이프라인 DB 적재 테스트 ✅ (2026-04-05)
+
+**발견 및 해결한 버그 5종:**
+
+| 버그 | 원인 | 해결 |
+|------|------|------|
+| off-by-one (날짜 범위) | `forecast_end`가 N+1일 자정 → 1일 초과 수집 | `(forecast_end - timedelta(seconds=1))` 적용 (HYCOM, NOAA 모두) |
+| HYCOM OOM — 파일 크기 | float64 기본값 + 비압축 저장 → 1,046 MB | float32 변환 + zlib 압축(complevel=4) → 526 MB |
+| HYCOM OOM — water_v 시간차원 | HYCOM FMRC에서 `water_u`는 `time`(8스텝), `water_v`는 `time1`(121스텝) 사용 → `sel(time=...)` 필터 미적용 | 변수별 시간차원 개별 탐색 후 선택, `inner merge`로 공통 타임스텝(3시간 간격)만 유지 |
+| HYCOM OOM — DB 적재 | `ds.to_dataframe()` 전체 일괄 변환 시 OOM | `_load_by_timesteps()` 헬퍼 함수 신규 구현 — 시간 스텝 1개씩 처리 |
+| ECMWF 예보 wind 육지 잔존 | UPSERT(전략 C)는 신규 데이터에 없는 행(육지)을 삭제 못 함 | 전략 D(TRUNCATE → COPY)로 교체 — 항상 최신 예보만 유지 |
+| ECMWF 예보 wind 해양필터 미적용 | 예보 wind는 오늘 날짜 → 재분석 wave 파일(5~7일 지연) 없음 | `_find_latest_reanalysis_wave()` 추가 — 재분석 폴더에서 최신 wave 파일 자동 탐색 |
+
+**최종 적재 결과:**
+```
+env_ecmwf_forecast:  2,856,870행  (2026-04-04, 5스텝 × 6시간 간격, 해양 필터 55%)
+env_hycom_forecast: 17,004,000행  (2026-04-04, 8스텝 × 3시간 간격)
+env_noaa_forecast:   3,428,472행  (2026-04-04, 24스텝 × 1시간 간격)
+```
+
+---
+
+### ✅ 완료된 작업 (Phase 15-A, 2026-04-05)
+
+#### Phase 15-A: 스케줄러 설정 (Windows Task Scheduler) ✅
+
+**수집 시작일 제한 (용량 절감):**
+- `config/settings.toml`에 `reanalysis_start_date = "2026-03-29"` 추가
+- `coverage.py` `get_backfill_dates()`: `max(today - lookback_days, reanalysis_start_date)` 하한선 적용
+- 효과: 2026-03-29 이전 날짜는 재분석 수집 대상에서 영구 제외
+
+**생성 파일:**
+- `scheduler/run_pipeline.bat` — WSL 경유 Python 실행 배치 파일
+- `scheduler/pipeline_task.xml` — Task Scheduler 등록 XML
+
+**Task Scheduler 등록 명령 (PowerShell 관리자 권한):**
+```powershell
+schtasks /Create /XML "C:\Users\hjlee\llm_for_ship\scheduler\pipeline_task.xml" /TN "llm_for_ship_pipeline"
+```
+
+**스케줄러 동작:**
+- 매일 10:00 KST 자동 실행 (`--mode auto`)
+- 실행 로그: `logs/pipeline_YYYY-MM-DD.log`
+- 조건: 네트워크 연결 시만 실행
+- 실패 시 1시간 후 1회 재시도
+- PC가 꺼져 있다가 켜지면 즉시 실행 (`StartWhenAvailable=true`)
+
+---
+
+### ✅ 완료된 작업 (Phase 15-B, 2026-04-05)
+
+#### Phase 15-B: 관리자 모니터링 대시보드 (Streamlit) ✅
+
+**구현 파일:**
+- `monitoring/app.py` — Streamlit 대시보드 메인 파일
+- `.streamlit/config.toml` — 서버 설정 (이메일 프롬프트 비활성화)
+
+**대시보드 구성 화면 (5개 섹션):**
+
+| 섹션 | 내용 |
+|------|------|
+| **① 파이프라인 상태 요약** | 소스별 최신 상태 카드 (complete/failed/missing 등) |
+| **② 데이터 커버리지 달력** | 최근 14일 × 6개 소스 컬럼 — complete=초록, forecast_only=파랑, failed=빨강, missing=회색 |
+| **③ 예보 데이터 현황** | 예보 테이블별 issued_at 최신 시각 + 커버 범위 |
+| **④ DB 적재 현황** | 테이블별 전체 행 수 |
+| **⑤ 최근 파이프라인 로그** | 최근 50줄 실시간 표시 |
+
+**커버리지 달력 컬럼 설계:**
+- `SOURCE_SPLIT`: `ecmwf_reanalysis` → `Wind 재분석` + `Wave 재분석` (1개 소스 → 2개 컬럼)
+- 컬럼 순서: `Wind 재분석 / Wave 재분석 / Current 재분석 / Wind 예보 / Wave 예보 / Current 예보`
+- 데이터 없는 컬럼도 항상 표시 (base 14일 × 6컬럼 프리셋 후 merge)
+
+**실행 방법:**
+```bash
+uv run streamlit run monitoring/app.py
+# 브라우저: http://localhost:8501
+```
+
+**주요 버그 수정 이력:**
+- `pd.read_sql_query` SQLAlchemy 경고 → psycopg2 cursor 직접 사용 (`_fetch_df()` 헬퍼)
+- 첫 실행 이메일 프롬프트 → `.streamlit/config.toml` `gatherUsageStats = false`
+- Wind/Wave 재분석 컬럼 누락 → base DataFrame 프리셋 후 merge로 해결
+
+---
+
+### ✅ 완료된 작업 (Phase 15-C, 2026-04-05)
+
+#### Phase 15-C: 재분석 백필 (2026-03-29 ~ 2026-04-02) ✅
+
+**배경:**
+- `era5_delay_days = 7` 기본값으로는 오늘(4/5) 기준 3/29만 수집 가능
+- 3/30~4/2 구간 수집을 위해 임시로 `era5_delay_days = 3`으로 변경 후 수동 실행
+
+**1단계 (era5_delay_days=7):** 3/29 ECMWF + HYCOM 수집
+**2단계 (era5_delay_days=3):** 3/30~3/31 ECMWF + 3/31~4/2 HYCOM 추가 수집
+
+**최종 커버리지 결과:**
+| 날짜 | ECMWF (Wind+Wave) | HYCOM (Current) |
+|------|-------------------|-----------------|
+| 3/29 | ✅ complete | ✅ complete |
+| 3/30 | ✅ complete | ✅ complete |
+| 3/31 | ✅ complete | ✅ complete |
+| 4/01 | ❌ failed (ERA5T 미제공) | ✅ complete |
+| 4/02 | ❌ failed (ERA5T 미제공) | ✅ complete |
+
+- 4/1, 4/2 ECMWF: ERA5T 아직 미제공 → 수일 내 스케줄러 자동 재시도로 수집 예정
+- 작업 후 `era5_delay_days = 7`로 복원 완료
+
+**예보 데이터 (최신 issued_at 기준):**
+```
+env_ecmwf_forecast:  23,405,793행  (2026-04-05 issued, 10일 예보, 해양 필터 55%)
+env_hycom_forecast:  85,020,000행  (2026-04-05 issued, 5일 예보)
+env_noaa_forecast:   17,127,120행  (2026-04-05 issued, 5일 예보)
+```
+
+---
 
 ### 중기
 - [ ] **ERA5T 명시적 수집**: CDS API `product_type` 파라미터 조정 검토
 - [ ] **Spec 문서**: `specs/hycom_current.md`, `specs/noaa_forecast.md` 작성
 - [x] ~~**ECMWF wave 컬럼 정리**~~: Phase 9에서 완료 (2026-03-17)
-- [x] ~~**UPSERT 전환**~~: Phase 10-C에서 구현 예정
 
 ### 장기
 - [ ] **과거 전체 데이터**: 2021-01-01 ~ 현재 일괄 적재 (`--manual` 옵션 활용)
@@ -772,6 +933,17 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 | 예보 해류 출처 | HYCOM Forecast OPeNDAP (A안) | 기존 코드 재사용, 추가 가입 불필요 |
 | 예보 DB 설계 | issued_at 컬럼 추가 | 동일 시각 예보가 매일 갱신되므로 발행일 구분 필요 |
 | 갱신 주기 | 1일 1회 | 운영 단순성 |
+| Wind 해양 필터링 | wave NaN 마스크 기준 inner join (Phase 12) | 별도 마스크 파일 불필요, wave 파일과 항상 세트 적재되므로 의존성 없음 |
+| Wind 육지 데이터 처리 | 기존 2026-03-05 재적재 안 함, 이후 분부터 필터링 | 1일치 불일치는 허용 (재적재 비용 대비 실익 없음) |
+| HYCOM 단독 적재 모드 | `--mode load_hycom_only` 신규 추가 (Phase 13) | `load_only`는 ECMWF까지 전체 적재 → HYCOM 단독 테스트·백필 시 불필요한 작업 방지 |
+| 재분석 complete 판정 기준 | 에러 없음 = complete (Phase 14-A 예정) | 행 수 비교는 해양 필터링·HYCOM 실제 격자 수와 맞지 않아 항상 partial 판정 → 에러 기반으로 변경 |
+| 예보 테이블 PK 재설계 | `(datetime, lat, lon)` + issued_at 일반 컬럼 (Phase 14-B 예정) | 기존 `(issued_at, datetime, lat, lon)` PK는 매일 쌓이기만 함 → 최신 예보로 덮어쓰는 UPSERT 구조로 변경 |
+| 예보 적재 이중 버전 관리 | 최신 issued_at 기준 덮어쓰기, 구버전 자동 삭제 | 예보는 "현재 가장 좋은 예측"만 필요 — 과거 발행본 보관 불필요 |
+| 예보 coverage 기록 | `pipeline_coverage`에 `forecast_only` 상태 기록 (Phase 14-C 예정) | 예보 적재 누락을 대시보드에서 감지 가능하도록 |
+| HYCOM 영구 손실 복구 | 인근 날짜 데이터 복제 정책 (Phase 15-B 대시보드 연계) | 롤링 윈도우(D-10) 초과 손실 시 공백보다 인근 복제가 LLM 참조 품질에서 나음 |
+| 관리자 대시보드 | Streamlit (Phase 15-B 완료) | Python 단독 실행, 별도 프론트엔드 불필요, pipeline_coverage 테이블 직접 조회 |
+| 운영 스케줄러 | Windows Task Scheduler + WSL (Phase 15-A 완료) | 매일 10:00 KST 자동 실행 (`--mode auto`) |
+| HYCOM 예보 기간 | 5일 유지 (확장 계획 없음) | HYCOM 영구 손실 복구는 인근 날짜 복제 정책으로 처리 — 예보 연장 불필요 |
 
 ---
 
@@ -836,6 +1008,24 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 - 파랑 예보(9개 변수)는 `env_noaa_forecast` 테이블에서 전담
 - LLM Agent 개발 시: 바람 → `env_ecmwf_forecast`, 파랑 → `env_noaa_forecast`, 해류 → `env_hycom_forecast`
 
+### EXPECTED_ROWS 불일치 (Phase 14-A 에서 수정 예정)
+- `coverage.py`의 `EXPECTED_ROWS` 상수가 실제 적재 행 수와 맞지 않음
+  - `SOURCE_ECMWF_REANALYSIS = 24_917_760` → 해양 필터링 후 실제 ≈ 13.8M (55%)
+  - `SOURCE_HYCOM_CURRENT = 12_008_008` → 실제 17,004,000
+- 현재 결과: 모든 날짜가 `partial` 판정 → `cleanup_superseded_forecasts()` 미실행 → 예보 데이터 누적
+- Phase 14-A에서 에러 기반 판정으로 변경 예정
+
+### 예보 데이터 관리 정책 (Phase 14-B 변경 후)
+- 예보 테이블 PK 변경 전 (`issued_at, datetime, lat, lon`): 매일 새 행이 추가되어 구버전 삭제 안 됨
+- 예보 테이블 PK 변경 후 (`datetime, lat, lon`): 같은 시각에 최신 예보로 UPSERT, 자동 교체
+- LLM Agent 쿼리: 변경 후에는 단순 `SELECT` 로 항상 최신 예보 조회 가능 (`MAX(issued_at)` 불필요)
+
+### HYCOM 롤링 윈도우 영구 손실 리스크
+- HYCOM 분석 OPeNDAP는 약 D-10일 ~ D+5일의 롤링 윈도우만 보유
+- D-10 이전 날짜는 OPeNDAP에서 삭제됨 → 해당 날짜 다운로드 미완료 시 영구 손실
+- 손실 감지: `pipeline_coverage`의 `permanent_forecast` 상태 (check_and_promote_hycom_permanent 함수)
+- 손실 복구 정책: 인근 날짜 데이터 복제 (`INSERT ... SELECT` 방식) — Phase 15-B 대시보드에서 안내
+
 ---
 
 ## 12. GitHub 저장소
@@ -853,6 +1043,9 @@ uv run python scripts/check_forecast_vars.py --file data/noaa/forecast/2026/03/n
 | `55b9c0a` | 2026-03-17 | docs: Project Plan Phase 9 반영 (ECMWF 파랑 수집 제거 완료) |
 | `0c054b2` | 2026-03-18 | chore: pyproject.toml Windows x64 환경 지원 추가 |
 | `2d4b1e8` | 2026-03-18 | docs: Project Plan Windows 환경 지원 내용 반영 |
-| (미완료) | 2026-03-18 | docs: Phase 10 파이프라인 상태 관리 설계 반영 |
-| (예정) | 2026-03-21 | feat: DB 적재 성능 최적화 (Strategy A/B, COPY 청크 스트리밍) |
-| (예정) | 2026-03-21 | docs: Project Plan Phase 10~11 반영 |
+| (미커밋) | 2026-03-18~21 | feat: Phase 10 파이프라인 상태관리 + Phase 11 DB 성능 최적화 |
+| (미커밋) | 2026-04-04 | feat: Phase 12 Wind 해양 격자 필터링 (loader.py 3.6단계 추가) |
+| (미커밋) | 2026-04-04 | feat: Phase 13 load_hycom_only 모드 추가 + Step 6 HYCOM 적재 완료 |
+| (미커밋) | 2026-04-05 | feat: Phase 14 예보 파이프라인 DB 적재 완료 (PK 재설계·coverage 기록·버그 5종 수정) |
+| (미커밋) | 2026-04-05 | feat: Phase 15-A 스케줄러 설정 + Phase 15-B Streamlit 모니터링 대시보드 |
+| (미커밋) | 2026-04-05 | docs: Project Plan Phase 14~15-C 완료 반영 |

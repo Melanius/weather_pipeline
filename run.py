@@ -77,7 +77,8 @@ def main():
 실행 예시:
   python run.py                                   자동 일일 파이프라인 (기본값)
   python run.py --mode download_only              재분석 다운로드만 (DB 불필요)
-  python run.py --mode load_only                  기존 파일 DB 적재만
+  python run.py --mode load_only                  기존 파일 DB 적재만 (ECMWF + HYCOM 전체)
+  python run.py --mode load_hycom_only --manual   HYCOM 해류만 DB 적재 (ECMWF 건너뜀)
   python run.py --mode forecast_only              예보 다운로드 + 적재만
   python run.py --init-db                         DB 스키마만 생성
   python run.py --manual                          down.json 날짜 범위로 수동 백필
@@ -96,7 +97,8 @@ def main():
         choices=[
             "auto",                    # 자동 일일 파이프라인 (Phase 10 기본값)
             "download_only",           # 재분석 다운로드만 (DB/Docker 불필요)
-            "load_only",               # 재분석 기존 파일 DB 적재만
+            "load_only",               # 재분석 기존 파일 DB 적재만 (ECMWF + HYCOM 전체)
+            "load_hycom_only",         # HYCOM 해류 파일만 DB 적재 (ECMWF 건너뜀)
             "forecast_only",           # 예보 다운로드 + DB 적재만
             "forecast_download_only",  # 예보 다운로드만 (DB 적재 없음)
             # 하위 호환 (Phase 9 이전 모드명)
@@ -180,6 +182,19 @@ def main():
         ),
     )
 
+    # --reinit-forecast: 예보 테이블 3개를 새 스키마로 재생성 (Phase 14-B 마이그레이션)
+    # ⚠️ 기존 예보 데이터 삭제 → 예보 데이터 없는 현재 단계에서만 사용
+    parser.add_argument(
+        "--reinit-forecast",
+        action="store_true",
+        help=(
+            "예보 테이블 3개(env_ecmwf_forecast / env_hycom_forecast / env_noaa_forecast)를 "
+            "신 PK 스키마(datetime, lat, lon)로 재생성. "
+            "⚠️ 기존 예보 데이터가 모두 삭제됩니다. "
+            "Phase 14-B 마이그레이션 1회용."
+        ),
+    )
+
     # 인수 파싱 실행
     args = parser.parse_args()
 
@@ -203,7 +218,7 @@ def main():
 
     # ── .env 로드 후 import (환경변수 적용 필요) ──
     from src.env_pipeline.pipeline import run_pipeline
-    from src.env_pipeline.db.schema import initialize_schema
+    from src.env_pipeline.db.schema import initialize_schema, reinit_forecast_tables
 
     # ── --simulate-date 파싱 ──
     today_override: date | None = None
@@ -230,6 +245,12 @@ def main():
         logger.info("DB 스키마 초기화 전용 실행")
         initialize_schema()
         logger.success("스키마 초기화 완료!")
+        return
+
+    if args.reinit_forecast:
+        # --reinit-forecast: 예보 테이블 3개를 신 PK 스키마로 재생성 (Phase 14-B)
+        logger.warning("예보 테이블 스키마 마이그레이션 실행 (기존 예보 데이터 삭제)")
+        reinit_forecast_tables()
         return
 
     if args.diagnose:

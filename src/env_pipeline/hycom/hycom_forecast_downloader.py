@@ -155,11 +155,45 @@ class HYCOMForecastDownloader:
             # ── 2단계: 예보 시간 범위 선택 ──
             # 오늘 00:00 UTC부터 forecast_days 이후까지
             day_start = forecast_start.strftime("%Y-%m-%dT00:00:00")
-            day_end   = forecast_end.strftime("%Y-%m-%dT23:59:59")
+            # forecast_end = issued_at + N일 = "N+1일째 자정(00:00)"
+            # 여기서 1초를 빼면 "N일째 23:59:59" → 정확히 N일치만 선택됨
+            # (1초를 빼지 않으면 N+1일째 23:59:59까지 포함되어 1일 초과)
+            day_end   = (forecast_end - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S")
 
-            ds_fc = ds[CURRENT_VARIABLES].sel(
-                time=slice(day_start, day_end)
-            )
+            # HYCOM FMRC Best의 변수별 시간 차원 불일치 처리
+            #
+            # HYCOM FMRC 데이터셋에서는 변수마다 다른 시간 차원을 사용할 수 있음:
+            #   water_u → 'time'  (3시간 간격 출력)
+            #   water_v → 'time1' (1시간 간격 출력, 최대 5일 = 121스텝)
+            # ds[vars].sel(time=slice(...))은 'time' 차원이 없는 변수(time1 사용)에는
+            # 필터가 적용되지 않아 water_v가 121스텝 전체로 저장되는 OOM 버그 발생.
+            #
+            # 해결: 각 변수를 독립적으로 해당 시간 차원으로 선택 후 'time'으로 통일,
+            # xr.merge(join="inner")로 공통 시각(3시간 간격)만 남김.
+            var_datasets = []
+            for var in CURRENT_VARIABLES:
+                da        = ds[var]
+                # 이 변수의 시간 차원 이름 탐색 (time, time1, time2, ...)
+                time_dim  = next(
+                    (d for d in da.dims if d.startswith("time")), None
+                )
+                if time_dim is None:
+                    logger.warning(f"  {var}: 시간 차원을 찾을 수 없음 → 건너뜀")
+                    continue
+                # 해당 시간 차원으로 날짜 범위 선택
+                var_ds = da.sel({time_dim: slice(day_start, day_end)}).to_dataset(name=var)
+                # time1 등 비표준 이름을 'time'으로 통일 (merge를 위해)
+                if time_dim != "time":
+                    var_ds = var_ds.rename({time_dim: "time"})
+                    logger.debug(
+                        f"  {var}: 시간 차원 '{time_dim}' → 'time' 통일 "
+                        f"({len(var_ds.time)}스텝)"
+                    )
+                var_datasets.append(var_ds)
+
+            # 공통 시각만 교집합(inner)으로 병합
+            # water_u(3h) ∩ water_v(1h) → 3시간 간격 스텝만 남음
+            ds_fc = xr.merge(var_datasets, join="inner")
 
             # 선택된 시간 스텝 수 확인 (3시간 간격 × 5일 × 8 = 최대 40스텝)
             time_count = len(ds_fc.time)
@@ -203,8 +237,21 @@ class HYCOMForecastDownloader:
             ds_fc.attrs["forecast_days"] = self.forecast_days
             ds_fc.attrs["source"] = "HYCOM ESPC-D-V02 Forecast"
 
-            # ── 8단계: NetCDF 저장 ──
-            ds_fc.to_netcdf(str(output_path))
+            # ── 8단계: float32 변환 + zlib 압축 후 NetCDF 저장 ──
+            # HYCOM FMRC Best URL은 float64로 데이터를 제공 → 파일 크기 과다
+            # float32로 변환 시 파일 크기 약 1/2, 정밀도 손실은 해양 실용 범위 내
+            for var in list(ds_fc.data_vars):
+                if ds_fc[var].dtype == "float64":
+                    # float64 → float32 변환 (attrs 보존)
+                    ds_fc[var] = ds_fc[var].astype("float32")
+
+            # zlib 압축 인코딩: 분석 파일(~130 MB) 수준으로 압축 목표
+            # complevel=4: 속도와 압축률의 균형점 (1=빠름·덜압축, 9=느림·최대압축)
+            encoding = {
+                var: {"zlib": True, "complevel": 4, "dtype": "float32"}
+                for var in ds_fc.data_vars
+            }
+            ds_fc.to_netcdf(str(output_path), encoding=encoding)
             ds.close()   # 원격 연결 닫기
 
             size_mb = output_path.stat().st_size / (1024 * 1024)

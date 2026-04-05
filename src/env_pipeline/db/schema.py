@@ -141,25 +141,26 @@ SELECT add_compression_policy(
 # ─────────────────────────────────────────────────────
 
 # ECMWF HRES 예보 테이블 — 바람(u10, v10) 전용
-# issued_at: 예보 발행 시각 (언제 만들어진 예보인지)
-# datetime:  예보가 나타내는 실제 시각 (valid_time)
-# 동일 valid_time에 대해 매일 새 예보가 갱신되므로 issued_at 구분 필수
+# Phase 14-B PK 재설계:
+#   - 구 PK: (issued_at, datetime, lat, lon) → 매일 새 행이 추가되어 과거 예보가 누적됨
+#   - 신 PK: (datetime, lat, lon)            → 같은 유효시각에 최신 예보로 UPSERT (덮어쓰기)
+#   - issued_at: 일반 컬럼으로 유지 (발행 시각 정보 보존, 대시보드 조회용)
 #
 # ※ 파랑 변수는 env_noaa_forecast 테이블에서 전담
 #   (ECMWF Open Data 무료 tier에서 너울·풍파 6개 변수 미제공 확인 2026-03-17)
 SQL_CREATE_ECMWF_FORECAST_TABLE = """
 CREATE TABLE IF NOT EXISTS env_ecmwf_forecast (
-    issued_at TIMESTAMPTZ NOT NULL,  -- 예보 발행 시각 (run time, UTC)
-    datetime  TIMESTAMPTZ NOT NULL,  -- 예보 유효 시각 (valid time, UTC)
-    lat       REAL        NOT NULL,  -- 위도
-    lon       REAL        NOT NULL,  -- 경도
+    datetime  TIMESTAMPTZ NOT NULL,  -- 예보 유효 시각 (valid time, UTC) ← PK
+    lat       REAL        NOT NULL,  -- 위도 ← PK
+    lon       REAL        NOT NULL,  -- 경도 ← PK
+    issued_at TIMESTAMPTZ NOT NULL,  -- 예보 발행 시각 (run time, UTC) ← 일반 컬럼
 
     -- 바람(Wind) 변수 (ecmwf_fc_wind_* 파일에서 채워짐)
     u10   REAL,   -- 10m 동서 풍속 (m/s)
     v10   REAL,   -- 10m 남북 풍속 (m/s)
 
-    -- 복합 기본키: 동일 발행일+시각+위치 중복 방지
-    PRIMARY KEY (issued_at, datetime, lat, lon)
+    -- 복합 기본키: 동일 유효시각+위치 → 최신 예보로 UPSERT
+    PRIMARY KEY (datetime, lat, lon)
 );
 """
 
@@ -179,7 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_ecmwf_forecast_latlon
     ON env_ecmwf_forecast (lat, lon);
 """
 
-# ECMWF 예보 issued_at 기반 인덱스 (최신 예보 조회 시 성능)
+# ECMWF 예보 issued_at 인덱스 (대시보드에서 최신 발행 시각 조회용)
 SQL_CREATE_ECMWF_FORECAST_ISSUED_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_ecmwf_forecast_issued
     ON env_ecmwf_forecast (issued_at DESC);
@@ -190,18 +191,19 @@ CREATE INDEX IF NOT EXISTS idx_ecmwf_forecast_issued
 # HYCOM 예보 데이터 테이블
 # ─────────────────────────────────────────────────────
 
-# HYCOM 예보 테이블 (분석 테이블 + issued_at 컬럼)
+# HYCOM 예보 테이블 (Phase 14-B PK 재설계 적용)
+# 신 PK: (datetime, lat, lon) → 같은 유효시각에 최신 예보로 UPSERT
 SQL_CREATE_HYCOM_FORECAST_TABLE = """
 CREATE TABLE IF NOT EXISTS env_hycom_forecast (
-    issued_at TIMESTAMPTZ NOT NULL,  -- 예보 실행일 (다운로드 날짜, UTC)
-    datetime  TIMESTAMPTZ NOT NULL,  -- 예보 유효 시각 (3시간 간격)
-    lat       REAL        NOT NULL,  -- 위도
-    lon       REAL        NOT NULL,  -- 경도
+    datetime  TIMESTAMPTZ NOT NULL,  -- 예보 유효 시각 (3시간 간격) ← PK
+    lat       REAL        NOT NULL,  -- 위도 ← PK
+    lon       REAL        NOT NULL,  -- 경도 ← PK
+    issued_at TIMESTAMPTZ NOT NULL,  -- 예보 실행일 (다운로드 날짜, UTC) ← 일반 컬럼
 
     water_u   REAL,   -- 동서 해류 속도 (m/s)
     water_v   REAL,   -- 남북 해류 속도 (m/s)
 
-    PRIMARY KEY (issued_at, datetime, lat, lon)
+    PRIMARY KEY (datetime, lat, lon)
 );
 """
 
@@ -226,19 +228,16 @@ CREATE INDEX IF NOT EXISTS idx_hycom_forecast_issued
 # NOAA WW3 파랑 예보 데이터 테이블
 # ─────────────────────────────────────────────────────
 
-# NOAA WaveWatch III 파랑 예보 테이블
-# ECMWF 예보 테이블에서 wave 컬럼이 NULL인 문제를 보완:
-#   - env_ecmwf_forecast: wind(u10, v10) 전담
-#   - env_noaa_forecast:  wave 9개 변수 전담
-#
+# NOAA WaveWatch III 파랑 예보 테이블 (Phase 14-B PK 재설계 적용)
+# 신 PK: (datetime, lat, lon) → 같은 유효시각에 최신 예보로 UPSERT
 # 변수 출처: PacIOOS ERDDAP ww3_global
 # 컬럼명은 ECMWF wave 컬럼명과 동일하게 통일 (LLM 쿼리 일관성)
 SQL_CREATE_NOAA_FORECAST_TABLE = """
 CREATE TABLE IF NOT EXISTS env_noaa_forecast (
-    issued_at TIMESTAMPTZ NOT NULL,  -- 예보 실행일 (다운로드 날짜, UTC)
-    datetime  TIMESTAMPTZ NOT NULL,  -- 예보 유효 시각
-    lat       REAL        NOT NULL,  -- 위도 (-77.5 ~ 77.5, 0.5° 간격)
-    lon       REAL        NOT NULL,  -- 경도 (-180 ~ 180, 0.5° 간격)
+    datetime  TIMESTAMPTZ NOT NULL,  -- 예보 유효 시각 ← PK
+    lat       REAL        NOT NULL,  -- 위도 (-77.5 ~ 77.5, 0.5° 간격) ← PK
+    lon       REAL        NOT NULL,  -- 경도 (-180 ~ 180, 0.5° 간격) ← PK
+    issued_at TIMESTAMPTZ NOT NULL,  -- 예보 실행일 (다운로드 날짜, UTC) ← 일반 컬럼
 
     -- 파랑 변수 9개 (NOAA WW3 → ECMWF 컬럼명으로 통일)
     -- 복합파 (풍파 + 너울 합산)
@@ -256,8 +255,8 @@ CREATE TABLE IF NOT EXISTS env_noaa_forecast (
     mdww  REAL,   -- 풍파 방향 (°)      ← wdir
     mpww  REAL,   -- 풍파 주기 (s)      ← wper
 
-    -- 복합 기본키: 동일 발행일+시각+위치 중복 방지
-    PRIMARY KEY (issued_at, datetime, lat, lon)
+    -- 복합 기본키: 동일 유효시각+위치 → 최신 예보로 UPSERT
+    PRIMARY KEY (datetime, lat, lon)
 );
 """
 
@@ -332,6 +331,80 @@ SQL_CREATE_COVERAGE_STATUS_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_coverage_status
     ON pipeline_coverage (status, source);
 """
+
+
+# ─────────────────────────────────────────────────────
+# 예보 테이블 DROP SQL (Phase 14-B 마이그레이션용)
+# ─────────────────────────────────────────────────────
+
+# 예보 테이블 3개를 CASCADE로 삭제 (Hypertable + 인덱스 포함)
+# ⚠️ 데이터가 있는 경우 모두 삭제됨 — 마이그레이션 전 반드시 확인
+SQL_DROP_FORECAST_TABLES = """
+DROP TABLE IF EXISTS env_ecmwf_forecast CASCADE;
+DROP TABLE IF EXISTS env_hycom_forecast  CASCADE;
+DROP TABLE IF EXISTS env_noaa_forecast   CASCADE;
+"""
+
+
+def reinit_forecast_tables() -> None:
+    """
+    예보 테이블 3개를 삭제 후 신규 스키마로 재생성 (Phase 14-B 마이그레이션)
+
+    변경 내용:
+      - 구 PK: (issued_at, datetime, lat, lon)
+      - 신 PK: (datetime, lat, lon) + issued_at 일반 컬럼
+
+    ⚠️ 주의: 기존 예보 데이터가 모두 삭제됩니다.
+         재분석/분석 테이블(env_ecmwf_reanalysis, env_hycom_current)은 영향 없음.
+
+    실행 방법:
+      uv run python run.py --reinit-forecast
+    """
+    logger.warning(
+        "⚠️ 예보 테이블 스키마 마이그레이션 시작 "
+        "(env_ecmwf_forecast / env_hycom_forecast / env_noaa_forecast)"
+    )
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        # ── 1단계: 기존 예보 테이블 삭제 ──
+        logger.info("  예보 테이블 3개 삭제 중 (CASCADE)...")
+        cursor.execute(SQL_DROP_FORECAST_TABLES)
+
+        # ── 2단계: ECMWF 예보 테이블 재생성 ──
+        logger.info("  ECMWF 예보 테이블 재생성 중...")
+        cursor.execute(SQL_CREATE_ECMWF_FORECAST_TABLE)
+        cursor.execute(SQL_CREATE_ECMWF_FORECAST_HYPERTABLE)
+        cursor.execute(SQL_CREATE_ECMWF_FORECAST_INDEX)
+        cursor.execute(SQL_CREATE_ECMWF_FORECAST_ISSUED_INDEX)
+
+        # ── 3단계: HYCOM 예보 테이블 재생성 ──
+        logger.info("  HYCOM 예보 테이블 재생성 중...")
+        cursor.execute(SQL_CREATE_HYCOM_FORECAST_TABLE)
+        cursor.execute(SQL_CREATE_HYCOM_FORECAST_HYPERTABLE)
+        cursor.execute(SQL_CREATE_HYCOM_FORECAST_ISSUED_INDEX)
+
+        # ── 4단계: NOAA WW3 예보 테이블 재생성 ──
+        logger.info("  NOAA WW3 예보 테이블 재생성 중...")
+        cursor.execute(SQL_CREATE_NOAA_FORECAST_TABLE)
+        cursor.execute(SQL_CREATE_NOAA_FORECAST_HYPERTABLE)
+        cursor.execute(SQL_CREATE_NOAA_FORECAST_LATLON_INDEX)
+        cursor.execute(SQL_CREATE_NOAA_FORECAST_ISSUED_INDEX)
+
+        conn.commit()
+        cursor.close()
+        logger.success(
+            "예보 테이블 스키마 마이그레이션 완료 "
+            "(신 PK: datetime, lat, lon / issued_at → 일반 컬럼)"
+        )
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"예보 테이블 마이그레이션 실패: {e}")
+        raise
+    finally:
+        conn.close()
 
 
 def initialize_schema() -> None:

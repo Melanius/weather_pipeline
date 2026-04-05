@@ -14,7 +14,8 @@ Phase 10 동작 방식:
                      coverage 테이블 기반 누락 날짜 자동 감지 + 예보 포함
   download_only    → 다운로드만 (DB/Docker 불필요)
                      로컬 파일 스캔으로 누락 감지 OR --manual 로 날짜 범위 지정
-  load_only        → 로컬 .nc 파일 → DB 적재만 (다운로드 생략)
+  load_only        → 로컬 .nc 파일 → DB 적재만 (ECMWF + HYCOM 전체, 다운로드 생략)
+  load_hycom_only  → HYCOM 해류 파일만 DB 적재 (ECMWF 건너뜀, 다운로드 생략)
   forecast_only    → 예보 다운로드 + DB 적재만 (재분석 생략)
 
 하위 호환 모드 (Phase 9 이전):
@@ -48,9 +49,12 @@ from .db.coverage import (
     STATUS_COMPLETE,
     STATUS_PARTIAL,
     STATUS_FAILED,
+    STATUS_FORECAST_ONLY,
     SOURCE_ECMWF_REANALYSIS,
     SOURCE_HYCOM_CURRENT,
-    EXPECTED_ROWS,
+    SOURCE_ECMWF_FORECAST,
+    SOURCE_NOAA_FORECAST,
+    SOURCE_HYCOM_FORECAST,
 )
 
 
@@ -128,26 +132,28 @@ def _load_ecmwf_day_to_db(
     wind_path: Path | None,
     wave_path: Path | None,
     batch_size: int,
-    partial_threshold: float,
     dry_run: bool,
 ) -> None:
     """
     ECMWF 하루치 wind + wave 파일을 DB에 적재하고 pipeline_coverage를 업데이트.
 
     wind와 wave 두 파일이 같은 테이블(env_ecmwf_reanalysis)에 적재됨:
-      - wind 파일: u10, v10 컬럼 INSERT (wind 컬럼만 갱신)
+      - wind 파일: u10, v10 컬럼 INSERT (wind 컬럼만 갱신, 해양 격자만 필터링)
       - wave 파일: swh 등 9개 파랑 컬럼 UPDATE (ON CONFLICT DO UPDATE)
-    두 파일이 모두 기대 행수 이상이면 'complete', 하나만 성공하면 'partial'.
+
+    완료 판정 기준 (Phase 14-A):
+      - wind + wave 모두 예외 없이 성공 → complete
+      - 한 파일만 성공 → partial
+      - 둘 다 실패 or 파일 없음 → failed
 
     Parameters
     ----------
-    conn             : psycopg2 연결 (coverage 업데이트용)
-    target_date      : 처리 대상 날짜
-    wind_path        : ecmwf_wind_YYYYMMDD.nc 경로 (없으면 None)
-    wave_path        : ecmwf_wave_YYYYMMDD.nc 경로 (없으면 None)
-    batch_size       : DB COPY 배치 크기
-    partial_threshold: 기대 행수 대비 최소 비율 (기본 0.95)
-    dry_run          : True 이면 DB 적재 없이 로그만 출력
+    conn        : psycopg2 연결 (coverage 업데이트용)
+    target_date : 처리 대상 날짜
+    wind_path   : ecmwf_wind_YYYYMMDD.nc 경로 (없으면 None)
+    wave_path   : ecmwf_wave_YYYYMMDD.nc 경로 (없으면 None)
+    batch_size  : DB COPY 배치 크기
+    dry_run     : True 이면 DB 적재 없이 로그만 출력
     """
     # ── dry_run: 파일 존재 여부만 확인하고 DB 변경 없이 반환 ──
     if dry_run:
@@ -160,7 +166,6 @@ def _load_ecmwf_day_to_db(
         )
         return
 
-    expected  = EXPECTED_ROWS[SOURCE_ECMWF_REANALYSIS]
     rows_wind = 0
     rows_wave = 0
     wind_ok   = False
@@ -168,50 +173,31 @@ def _load_ecmwf_day_to_db(
 
     # ── wind 파일 적재 ──
     if wind_path and wind_path.exists() and wind_path.stat().st_size > 0:
-        if dry_run:
-            logger.info(f"[DRY-RUN] wind 적재 건너뜀: {wind_path.name}")
+        try:
+            rows_wind = load_netcdf_to_db(wind_path, batch_size=batch_size)
             wind_ok   = True
-            rows_wind = expected  # dry_run: 기대 행수로 가정
-        else:
-            try:
-                rows_wind = load_netcdf_to_db(wind_path, batch_size=batch_size)
-                wind_ok   = True
-                logger.debug(f"  wind 적재 완료: {rows_wind:,}행")
-            except Exception as e:
-                logger.error(f"  wind 적재 실패 [{target_date}]: {e}")
+            logger.debug(f"  wind 적재 완료: {rows_wind:,}행")
+        except Exception as e:
+            logger.error(f"  wind 적재 실패 [{target_date}]: {e}")
     else:
         logger.warning(f"  wind 파일 없음 또는 빈 파일: {target_date}")
 
     # ── wave 파일 적재 ──
     if wave_path and wave_path.exists() and wave_path.stat().st_size > 0:
-        if dry_run:
-            logger.info(f"[DRY-RUN] wave 적재 건너뜀: {wave_path.name}")
+        try:
+            rows_wave = load_netcdf_to_db(wave_path, batch_size=batch_size)
             wave_ok   = True
-            rows_wave = expected
-        else:
-            try:
-                rows_wave = load_netcdf_to_db(wave_path, batch_size=batch_size)
-                wave_ok   = True
-                logger.debug(f"  wave 적재 완료: {rows_wave:,}행")
-            except Exception as e:
-                logger.error(f"  wave 적재 실패 [{target_date}]: {e}")
+            logger.debug(f"  wave 적재 완료: {rows_wave:,}행")
+        except Exception as e:
+            logger.error(f"  wave 적재 실패 [{target_date}]: {e}")
     else:
         logger.warning(f"  wave 파일 없음 또는 빈 파일: {target_date}")
 
-    # ── 상태 결정 ──
+    # ── 상태 결정: 예외 없이 성공 여부 기준 ──
     if wind_ok and wave_ok:
-        # 두 파일 모두 성공 → 행수로 partial 여부 판단
-        if (rows_wind >= expected * partial_threshold
-                and rows_wave >= expected * partial_threshold):
-            status    = STATUS_COMPLETE
-            row_count = min(rows_wind, rows_wave)  # 보수적으로 최솟값 기록
-        else:
-            status    = STATUS_PARTIAL
-            row_count = min(rows_wind, rows_wave)
-            logger.warning(
-                f"  [{target_date}] ECMWF partial: "
-                f"wind={rows_wind:,}/{expected:,}, wave={rows_wave:,}/{expected:,}"
-            )
+        # 두 파일 모두 예외 없이 성공
+        status    = STATUS_COMPLETE
+        row_count = rows_wind  # wind 행 수 기록 (해양 격자 수)
     elif wind_ok or wave_ok:
         # 한 파일만 성공
         status    = STATUS_PARTIAL
@@ -230,7 +216,7 @@ def _load_ecmwf_day_to_db(
     conn.commit()
 
     if status == STATUS_COMPLETE:
-        logger.success(f"  [{target_date}] ECMWF 재분석 적재 완료")
+        logger.success(f"  [{target_date}] ECMWF 재분석 적재 완료 (wind {rows_wind:,}행)")
     elif status == STATUS_PARTIAL:
         logger.warning(f"  [{target_date}] ECMWF 재분석 partial 적재")
     else:
@@ -242,20 +228,23 @@ def _load_hycom_day_to_db(
     target_date: date,
     hycom_path: Path | None,
     batch_size: int,
-    partial_threshold: float,
     dry_run: bool,
 ) -> None:
     """
     HYCOM 하루치 파일을 DB에 적재하고 pipeline_coverage를 업데이트.
 
+    완료 판정 기준 (Phase 14-A):
+      - 예외 없이 적재 성공 (rows > 0) → complete
+      - 파일 없음 또는 빈 파일 → failed
+      - 예외 발생 → failed
+
     Parameters
     ----------
-    conn             : psycopg2 연결 (coverage 업데이트용)
-    target_date      : 처리 대상 날짜
-    hycom_path       : hycom_current_YYYYMMDD.nc 경로 (없으면 None)
-    batch_size       : DB COPY 배치 크기
-    partial_threshold: 기대 행수 대비 최소 비율 (기본 0.95)
-    dry_run          : True 이면 DB 적재 없이 로그만 출력
+    conn        : psycopg2 연결 (coverage 업데이트용)
+    target_date : 처리 대상 날짜
+    hycom_path  : hycom_current_YYYYMMDD.nc 경로 (없으면 None)
+    batch_size  : DB COPY 배치 크기
+    dry_run     : True 이면 DB 적재 없이 로그만 출력
     """
     # ── dry_run: 파일 존재 여부만 확인하고 DB 변경 없이 반환 ──
     if dry_run:
@@ -268,8 +257,6 @@ def _load_hycom_day_to_db(
         )
         return
 
-    expected = EXPECTED_ROWS[SOURCE_HYCOM_CURRENT]
-
     # 파일이 없거나 비어있는 경우
     if not hycom_path or not hycom_path.exists() or hycom_path.stat().st_size == 0:
         logger.warning(f"  HYCOM 파일 없음 또는 빈 파일: {target_date}")
@@ -280,31 +267,11 @@ def _load_hycom_day_to_db(
         conn.commit()
         return
 
-    if dry_run:
-        logger.info(f"[DRY-RUN] HYCOM 적재 건너뜀: {hycom_path.name}")
-        update_coverage(
-            conn, target_date, SOURCE_HYCOM_CURRENT, STATUS_COMPLETE,
-            row_count=expected
-        )
-        conn.commit()
-        return
-
     try:
-        rows   = load_netcdf_to_db(hycom_path, batch_size=batch_size)
-        status = (
-            STATUS_COMPLETE
-            if rows >= expected * partial_threshold
-            else STATUS_PARTIAL
-        )
-        if status == STATUS_PARTIAL:
-            logger.warning(
-                f"  [{target_date}] HYCOM partial: {rows:,}/{expected:,}"
-            )
-        update_coverage(conn, target_date, SOURCE_HYCOM_CURRENT, status, row_count=rows)
+        rows = load_netcdf_to_db(hycom_path, batch_size=batch_size)
+        update_coverage(conn, target_date, SOURCE_HYCOM_CURRENT, STATUS_COMPLETE, row_count=rows)
         conn.commit()
-
-        if status == STATUS_COMPLETE:
-            logger.success(f"  [{target_date}] HYCOM 해류 적재 완료")
+        logger.success(f"  [{target_date}] HYCOM 해류 적재 완료 ({rows:,}행)")
 
     except Exception as e:
         logger.error(f"  HYCOM 적재 실패 [{target_date}]: {e}")
@@ -336,7 +303,8 @@ def run_pipeline(
                                  coverage 기반 누락 날짜 자동 감지 + 예보 포함
         "download_only"        → 다운로드만 (DB/Docker 불필요)
                                  --manual 없으면 로컬 파일 스캔으로 누락 감지
-        "load_only"            → 로컬 .nc 파일 → DB 적재만 (다운로드 생략)
+        "load_only"            → 로컬 .nc 파일 → DB 적재만 (ECMWF + HYCOM 전체, 다운로드 생략)
+        "load_hycom_only"      → HYCOM 해류 파일만 DB 적재 (ECMWF 건너뜀, 다운로드 생략)
         "forecast_only"        → 예보 다운로드 + DB 적재만
 
         하위 호환 (Phase 9 이전):
@@ -401,8 +369,15 @@ def run_pipeline(
     lookback_days     = pipeline_cfg.get("coverage_lookback_days", 30)
     era5_delay_days   = pipeline_cfg.get("era5_delay_days", 7)
     hycom_window_days = pipeline_cfg.get("hycom_window_days", 10)
-    partial_threshold = pipeline_cfg.get("partial_threshold", 0.95)
     alert_threshold   = pipeline_cfg.get("alert_missing_days_threshold", 3)
+    # partial_threshold 는 Phase 14-A에서 제거됨 (에러 기반 판정으로 변경)
+
+    # reanalysis_start_date: 재분석 수집 최초 시작일 (고정 하한선)
+    # settings.toml에 없으면 None → 하한선 없이 lookback_days 그대로 적용
+    _start_str = pipeline_cfg.get("reanalysis_start_date", None)
+    reanalysis_start_date = (
+        date.fromisoformat(_start_str) if _start_str else None
+    )
 
     # ── 예보 기간 설정 ──
     if forecast_days_override is not None:
@@ -428,7 +403,7 @@ def run_pipeline(
 
     # ── 모드별 실행 플래그 ──
     need_db         = mode not in ("download_only", "forecast_download_only")
-    run_reanalysis  = mode in ("auto", "download_only", "load_only")
+    run_reanalysis  = mode in ("auto", "download_only", "load_only", "load_hycom_only")
     run_forecast    = mode in ("auto", "forecast_only", "forecast_download_only")
     forecast_need_db = need_db and mode != "forecast_download_only"
 
@@ -460,6 +435,36 @@ def run_pipeline(
                 f"load_only 스캔 결과: "
                 f"ECMWF {len(ecmwf_dates)}일 / HYCOM {len(hycom_dates)}일 적재 예정"
             )
+
+        elif mode == "load_hycom_only":
+            # load_hycom_only: HYCOM 해류 파일만 적재, ECMWF 완전 건너뜀
+            # --manual 플래그 사용 시 down.json 날짜 범위로 제한
+            # --manual 없으면 로컬 HYCOM 파일 전체 스캔
+            if manual_mode:
+                start_dt, end_dt = load_date_range(json_path)
+                start_d, end_d   = start_dt.date(), end_dt.date()
+                date_range = [
+                    start_d + timedelta(days=i)
+                    for i in range((end_d - start_d).days + 1)
+                ]
+                # 실제로 파일이 존재하는 날짜만 필터링
+                hycom_dates = [
+                    d for d in date_range
+                    if _nc_path_for_hycom(hycom_dir, d).exists()
+                    and _nc_path_for_hycom(hycom_dir, d).stat().st_size > 0
+                ]
+                logger.info(
+                    f"load_hycom_only (manual): {start_d} ~ {end_d} 범위 중 "
+                    f"파일 있는 {len(hycom_dates)}일 적재 예정"
+                )
+            else:
+                hycom_files = sorted(hycom_dir.rglob("hycom_current_*.nc"))
+                hycom_dates = [d for f in hycom_files if (d := _date_from_nc_path(f))]
+                logger.info(
+                    f"load_hycom_only 스캔 결과: HYCOM {len(hycom_dates)}일 적재 예정 "
+                    f"(ECMWF 건너뜀)"
+                )
+            ecmwf_dates = []  # ECMWF 적재 완전 생략
 
         elif manual_mode:
             # 수동 모드: down.json 의 manual_start/manual_end 범위 사용
@@ -516,8 +521,10 @@ def run_pipeline(
                     logger.info(f"HYCOM permanent_forecast 승격: {len(promoted)}일")
 
                 # coverage 기반 백필 대상 날짜 조회
+                # reanalysis_start_date: settings.toml의 고정 하한선 전달
                 backfill    = get_backfill_dates(
-                    conn_cov, today, lookback_days, era5_delay_days
+                    conn_cov, today, lookback_days, era5_delay_days,
+                    reanalysis_start_date=reanalysis_start_date,
                 )
                 ecmwf_dates = backfill[SOURCE_ECMWF_REANALYSIS]
                 hycom_dates = backfill[SOURCE_HYCOM_CURRENT]
@@ -531,9 +538,10 @@ def run_pipeline(
             logger.info("-" * 40)
 
             # download_only를 제외한 모드에서 ERA5Downloader 인스턴스 생성
+            # load_only / load_hycom_only 는 다운로드 없이 적재만
             ecmwf_downloader = (
                 ERA5Downloader(output_dir=ecmwf_dir)
-                if mode != "load_only"
+                if mode not in ("load_only", "load_hycom_only")
                 else None
             )
 
@@ -561,7 +569,7 @@ def run_pipeline(
                         _load_ecmwf_day_to_db(
                             conn_cov, d,
                             wind_path, wave_path,
-                            batch_size, partial_threshold, dry_run,
+                            batch_size, dry_run,
                         )
                     finally:
                         conn_cov.close()
@@ -573,9 +581,10 @@ def run_pipeline(
             logger.info(f"HYCOM 분석 해류 처리 시작: {len(hycom_dates)}일")
             logger.info("-" * 40)
 
+            # load_only / load_hycom_only 는 다운로드 없이 적재만
             hycom_downloader = (
                 HYCOMDownloader(output_dir=hycom_dir, stride=hycom_stride)
-                if mode != "load_only"
+                if mode not in ("load_only", "load_hycom_only")
                 else None
             )
 
@@ -600,7 +609,7 @@ def run_pipeline(
                         _load_hycom_day_to_db(
                             conn_cov, d,
                             hycom_path,
-                            batch_size, partial_threshold, dry_run,
+                            batch_size, dry_run,
                         )
                     finally:
                         conn_cov.close()
@@ -663,18 +672,54 @@ def run_pipeline(
             )
             noaa_fc_paths = noaa_fc_downloader.run()
 
-            # ── 예보 DB 적재 ──
+            # ── 예보 DB 적재 + pipeline_coverage 기록 (Phase 14-C) ──
             if forecast_need_db:
-                all_fc_paths = ecmwf_fc_paths + hycom_fc_paths + noaa_fc_paths
-                if all_fc_paths:
-                    logger.info(f"예보 DB 적재 시작: {len(all_fc_paths)}개 파일")
-                    result = load_multiple_files(all_fc_paths, batch_size=batch_size)
-                    logger.success(
-                        f"예보 적재 완료 | "
-                        f"성공: {result['success']}파일 / "
-                        f"총 {result['total_rows']:,}행"
-                    )
-                else:
-                    logger.warning("적재할 예보 파일이 없습니다.")
+                # 소스별로 개별 적재 → 각각 pipeline_coverage 기록
+                # 성공: STATUS_FORECAST_ONLY / 실패: STATUS_FAILED
+                fc_source_map = [
+                    (ecmwf_fc_paths, SOURCE_ECMWF_FORECAST,  "ECMWF 바람 예보"),
+                    (hycom_fc_paths, SOURCE_HYCOM_FORECAST,   "HYCOM 해류 예보"),
+                    (noaa_fc_paths,  SOURCE_NOAA_FORECAST,    "NOAA WW3 파랑 예보"),
+                ]
+                conn_cov = get_connection()
+                try:
+                    for fc_paths, source, label in fc_source_map:
+                        if not fc_paths:
+                            logger.warning(f"{label}: 다운로드된 파일 없음 → coverage=failed 기록")
+                            update_coverage(
+                                conn_cov, today, source, STATUS_FAILED,
+                                notes="다운로드 파일 없음"
+                            )
+                            conn_cov.commit()
+                            continue
+
+                        logger.info(f"{label} DB 적재 시작: {len(fc_paths)}개 파일")
+                        try:
+                            result = load_multiple_files(fc_paths, batch_size=batch_size)
+                            if result["success"] > 0:
+                                update_coverage(
+                                    conn_cov, today, source, STATUS_FORECAST_ONLY,
+                                    row_count=result["total_rows"],
+                                )
+                                logger.success(
+                                    f"{label} 적재 완료 | "
+                                    f"성공: {result['success']}파일 / "
+                                    f"총 {result['total_rows']:,}행"
+                                )
+                            else:
+                                update_coverage(
+                                    conn_cov, today, source, STATUS_FAILED,
+                                    notes="모든 파일 적재 실패"
+                                )
+                                logger.error(f"{label}: 모든 파일 적재 실패")
+                        except Exception as e:
+                            update_coverage(
+                                conn_cov, today, source, STATUS_FAILED,
+                                notes=str(e)[:200]
+                            )
+                            logger.error(f"{label} 적재 예외: {e}")
+                        conn_cov.commit()
+                finally:
+                    conn_cov.close()
 
     logger.success(f"파이프라인 완료 | 모드: {mode} | 기준 날짜: {today}")
