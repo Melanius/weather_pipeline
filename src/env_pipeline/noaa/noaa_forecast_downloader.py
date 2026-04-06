@@ -211,7 +211,14 @@ class NOAAForecastDownloader:
                 ds.close()
                 return []
 
-            # ── 3단계: 경도 변환 0~360 → -180~180 ──
+            # ── 3단계: 실제 데이터 메모리에 로드 ──
+            # .load()를 좌표 변환(sortby) 이전에 먼저 수행
+            # sortby는 fancy indexing을 사용하므로 OPeNDAP 백엔드에서 직접 호출 시
+            # "netCDF4.Variable indexing" 오류 발생 → 메모리 로드 후 변환 필요
+            logger.debug("  예보 데이터 전송 중... (수 초 ~ 수분 소요)")
+            ds_fc = ds_fc.load()
+
+            # ── 4단계: 경도 변환 0~360 → -180~180 ──
             # PacIOOS WW3 경도: 0~359.5 (0.5° 간격)
             # ECMWF/HYCOM은 -180~180 기준 → 일관성 유지를 위해 변환
             #
@@ -229,7 +236,7 @@ class NOAAForecastDownloader:
                 ).sortby(lon_coord)   # 변환 후 경도 오름차순으로 재정렬
                 logger.debug("  경도 변환 완료: 0~360 → -180~180")
 
-            # ── 4단계: 변수명 변환 NOAA → DB 컬럼명 ──
+            # ── 5단계: 변수명 변환 NOAA → DB 컬럼명 ──
             # NOAA WW3 변수명(Thgt, Tdir 등)을 DB 컬럼명(swh, mwd 등)으로 변경
             # ECMWF와 동일한 컬럼명을 사용하여 LLM 쿼리 통일성 확보
             ds_fc = ds_fc.rename(VARIABLE_RENAME)
@@ -237,12 +244,6 @@ class NOAAForecastDownloader:
                 f"  변수명 변환 완료: "
                 f"{list(VARIABLE_RENAME.keys())} → {list(VARIABLE_RENAME.values())}"
             )
-
-            # ── 5단계: 실제 데이터 메모리에 로드 ──
-            # 지금까지는 "무엇을 가져올지" 정의만 했음
-            # .load() 호출 시 실제 네트워크 전송 발생
-            logger.debug("  예보 데이터 전송 중... (수 초 ~ 수분 소요)")
-            ds_fc = ds_fc.load()
 
             # ── 5.5단계: timedelta64 변수를 float(초 단위)로 변환 ──
             # PacIOOS WW3의 sper(→mpts), wper(→mpww)는 units="seconds"를 가져
@@ -287,8 +288,9 @@ class NOAAForecastDownloader:
             # float32 변환 + zlib 압축으로 파일 크기를 크게 줄임
             for var in list(ds_fc.data_vars):
                 if ds_fc[var].dtype == "float64":
-                    # float64 → float32 변환 (attrs 보존)
-                    ds_fc[var] = ds_fc[var].astype("float32")
+                    # .load() 명시 호출: netCDF4.Variable 직접 인덱싱 오류 방지
+                    # (ds_fc.load() 이후 변수 재할당 시 백엔드 참조가 남아있는 경우 대비)
+                    ds_fc[var] = ds_fc[var].load().astype("float32")
 
             # zlib 압축 인코딩 (complevel=4: 속도·압축률 균형)
             encoding = {
