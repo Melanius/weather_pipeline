@@ -43,6 +43,7 @@ from .db.connection import get_connection
 from .db.coverage import (
     update_coverage,
     get_backfill_dates,
+    get_retry_targets,
     cleanup_superseded_forecasts,
     check_and_promote_hycom_permanent,
     alert_long_missing,
@@ -55,6 +56,9 @@ from .db.coverage import (
     SOURCE_ECMWF_FORECAST,
     SOURCE_NOAA_FORECAST,
     SOURCE_HYCOM_FORECAST,
+    # Phase 17: 다운로드/적재 단계별 상태 상수
+    DL_COMPLETE, DL_FAILED, DL_SKIPPED,
+    LOAD_COMPLETE, LOAD_PARTIAL, LOAD_FAILED, LOAD_SKIPPED,
 )
 
 
@@ -211,8 +215,18 @@ def _load_ecmwf_day_to_db(
         status    = STATUS_FAILED
         row_count = 0
 
+    # load_status 결정: LOAD_* 상수로 적재 단계 상태를 명시적으로 기록 (Phase 17)
+    load_status = (
+        LOAD_COMPLETE if status == STATUS_COMPLETE else
+        LOAD_PARTIAL  if status == STATUS_PARTIAL  else
+        LOAD_FAILED
+    )
+
     # coverage 갱신 및 커밋 (pipeline.py가 연결을 소유하므로 여기서 커밋)
-    update_coverage(conn, target_date, SOURCE_ECMWF_REANALYSIS, status, row_count=row_count)
+    update_coverage(
+        conn, target_date, SOURCE_ECMWF_REANALYSIS, status,
+        row_count=row_count, load_status=load_status,
+    )
     conn.commit()
 
     if status == STATUS_COMPLETE:
@@ -262,14 +276,18 @@ def _load_hycom_day_to_db(
         logger.warning(f"  HYCOM 파일 없음 또는 빈 파일: {target_date}")
         update_coverage(
             conn, target_date, SOURCE_HYCOM_CURRENT, STATUS_FAILED,
-            notes="파일 없음 또는 빈 파일"
+            notes="파일 없음 또는 빈 파일",
+            load_status=LOAD_SKIPPED,   # 파일 없어서 적재 미시도
         )
         conn.commit()
         return
 
     try:
         rows = load_netcdf_to_db(hycom_path, batch_size=batch_size)
-        update_coverage(conn, target_date, SOURCE_HYCOM_CURRENT, STATUS_COMPLETE, row_count=rows)
+        update_coverage(
+            conn, target_date, SOURCE_HYCOM_CURRENT, STATUS_COMPLETE,
+            row_count=rows, load_status=LOAD_COMPLETE,
+        )
         conn.commit()
         logger.success(f"  [{target_date}] HYCOM 해류 적재 완료 ({rows:,}행)")
 
@@ -277,7 +295,7 @@ def _load_hycom_day_to_db(
         logger.error(f"  HYCOM 적재 실패 [{target_date}]: {e}")
         update_coverage(
             conn, target_date, SOURCE_HYCOM_CURRENT, STATUS_FAILED,
-            notes=str(e)[:200]
+            notes=str(e)[:200], load_status=LOAD_FAILED,
         )
         conn.commit()
 
@@ -557,8 +575,29 @@ def run_pipeline(
                             f"{d.strftime('%Y-%m-%d')} wind/wave"
                         )
                     else:
-                        ecmwf_downloader.download_day(dt, "wind", ecmwf_resolution)
-                        ecmwf_downloader.download_day(dt, "wave", ecmwf_resolution)
+                        # download_day 반환값: 성공=Path, 실패=None (내부에서 예외 처리됨)
+                        dl_wind = ecmwf_downloader.download_day(dt, "wind", ecmwf_resolution)
+                        dl_wave = ecmwf_downloader.download_day(dt, "wave", ecmwf_resolution)
+
+                        # download_status 기록 (두 파일 모두 성공해야 complete)
+                        dl_status = DL_COMPLETE if (dl_wind and dl_wave) else DL_FAILED
+                        conn_dl = get_connection()
+                        try:
+                            update_coverage(
+                                conn_dl, d, SOURCE_ECMWF_REANALYSIS,
+                                STATUS_PARTIAL,          # 다운로드 완료, 아직 적재 전
+                                download_status=dl_status,
+                            )
+                            conn_dl.commit()
+                        finally:
+                            conn_dl.close()
+
+                        if dl_status == DL_FAILED:
+                            logger.warning(
+                                f"  [{d}] ECMWF 다운로드 실패 "
+                                f"(wind={'OK' if dl_wind else 'FAIL'}, "
+                                f"wave={'OK' if dl_wave else 'FAIL'})"
+                            )
 
                 # DB 적재 + coverage 업데이트 (download_only가 아닌 경우)
                 if need_db:
@@ -599,7 +638,24 @@ def run_pipeline(
                             f"{d.strftime('%Y-%m-%d')}"
                         )
                     else:
-                        hycom_downloader.download_day(dt)
+                        # download_day 반환값: 성공=Path, 실패=None
+                        dl_hycom = hycom_downloader.download_day(dt)
+
+                        # download_status 기록
+                        dl_status = DL_COMPLETE if dl_hycom else DL_FAILED
+                        conn_dl = get_connection()
+                        try:
+                            update_coverage(
+                                conn_dl, d, SOURCE_HYCOM_CURRENT,
+                                STATUS_PARTIAL,          # 다운로드 완료, 아직 적재 전
+                                download_status=dl_status,
+                            )
+                            conn_dl.commit()
+                        finally:
+                            conn_dl.close()
+
+                        if dl_status == DL_FAILED:
+                            logger.warning(f"  [{d}] HYCOM 다운로드 실패")
 
                 # DB 적재 + coverage 업데이트
                 if need_db:
@@ -685,14 +741,18 @@ def run_pipeline(
                 try:
                     for fc_paths, source, label in fc_source_map:
                         if not fc_paths:
+                            # 다운로드 파일이 하나도 없음 → 다운로드 자체가 실패
                             logger.warning(f"{label}: 다운로드된 파일 없음 → coverage=failed 기록")
                             update_coverage(
                                 conn_cov, today, source, STATUS_FAILED,
-                                notes="다운로드 파일 없음"
+                                notes="다운로드 파일 없음",
+                                download_status=DL_FAILED,
+                                load_status=LOAD_SKIPPED,   # 다운로드 실패로 적재 미시도
                             )
                             conn_cov.commit()
                             continue
 
+                        # 다운로드 파일이 있으면 download_status = complete
                         logger.info(f"{label} DB 적재 시작: {len(fc_paths)}개 파일")
                         try:
                             result = load_multiple_files(fc_paths, batch_size=batch_size)
@@ -700,6 +760,8 @@ def run_pipeline(
                                 update_coverage(
                                     conn_cov, today, source, STATUS_FORECAST_ONLY,
                                     row_count=result["total_rows"],
+                                    download_status=DL_COMPLETE,
+                                    load_status=LOAD_COMPLETE,
                                 )
                                 logger.success(
                                     f"{label} 적재 완료 | "
@@ -709,17 +771,128 @@ def run_pipeline(
                             else:
                                 update_coverage(
                                     conn_cov, today, source, STATUS_FAILED,
-                                    notes="모든 파일 적재 실패"
+                                    notes="모든 파일 적재 실패",
+                                    download_status=DL_COMPLETE,
+                                    load_status=LOAD_FAILED,
                                 )
                                 logger.error(f"{label}: 모든 파일 적재 실패")
                         except Exception as e:
                             update_coverage(
                                 conn_cov, today, source, STATUS_FAILED,
-                                notes=str(e)[:200]
+                                notes=str(e)[:200],
+                                download_status=DL_COMPLETE,   # 파일은 있었음
+                                load_status=LOAD_FAILED,
                             )
                             logger.error(f"{label} 적재 예외: {e}")
                         conn_cov.commit()
                 finally:
                     conn_cov.close()
+
+    # ════════════════════════════════════════════════════
+    # STEP 5: 자동 재시도 패스 (Phase 17 신규)
+    # ════════════════════════════════════════════════════
+    # 앞선 STEP 1~4에서 처리 후에도 누락된 항목(다운로드 실패 / 적재 실패)을 자동 재시도.
+    # 재시도 대상 분류:
+    #   'download'  → 다운로드부터 다시 시작 (파일 다시 받고 적재까지 수행)
+    #   'load_only' → 다운로드 완료, 적재만 재시도 (로컬 파일 재사용)
+    #
+    # 조건: auto 모드이고 dry_run이 아니며 DB 접속 가능한 경우에만 실행
+    if need_db and not dry_run and mode not in ("download_only", "forecast_download_only"):
+        logger.info("=" * 55)
+        logger.info("STEP 5: 자동 재시도 패스")
+        logger.info("=" * 55)
+
+        conn_retry = get_connection()
+        try:
+            retry_targets = get_retry_targets(
+                conn_retry, today,
+                lookback_days=lookback_days,
+                reanalysis_start_date=reanalysis_start_date,
+            )
+        finally:
+            conn_retry.close()
+
+        if not retry_targets:
+            logger.info("STEP 5: 재시도 대상 없음 — 모두 완료")
+        else:
+            # 재시도 실행 (다운로드 포함 재시도는 소스별로 다운로더 재사용)
+            ecmwf_retry_dl  = ERA5Downloader(output_dir=ecmwf_dir)
+            hycom_retry_dl  = HYCOMDownloader(output_dir=hycom_dir, stride=hycom_stride)
+
+            for target in retry_targets:
+                d        = target["date"]
+                source   = target["source"]
+                rtype    = target["retry_type"]   # 'download' | 'load_only'
+                dt       = _to_datetime_utc(d)
+
+                logger.info(
+                    f"  [재시도] {d} [{source}] "
+                    f"retry_type={rtype} "
+                    f"(dl={target['download_status']}, ld={target['load_status']})"
+                )
+
+                # ── 재분석 소스 재시도 ──
+                if source == SOURCE_ECMWF_REANALYSIS:
+                    if rtype == "download":
+                        # 다운로드 재시도 후 적재
+                        dl_wind = ecmwf_retry_dl.download_day(dt, "wind", ecmwf_resolution)
+                        dl_wave = ecmwf_retry_dl.download_day(dt, "wave", ecmwf_resolution)
+                        dl_status = DL_COMPLETE if (dl_wind and dl_wave) else DL_FAILED
+                        # download_status 갱신 (적재 전)
+                        conn_upd = get_connection()
+                        try:
+                            update_coverage(
+                                conn_upd, d, SOURCE_ECMWF_REANALYSIS,
+                                STATUS_PARTIAL, download_status=dl_status,
+                            )
+                            conn_upd.commit()
+                        finally:
+                            conn_upd.close()
+                        if dl_status == DL_FAILED:
+                            logger.warning(f"  [{d}] ECMWF 재다운로드 실패 — 적재 건너뜀")
+                            continue
+
+                    # 적재 (download 또는 load_only 공통)
+                    wind_path = _nc_path_for_ecmwf(ecmwf_dir, d, "wind")
+                    wave_path = _nc_path_for_ecmwf(ecmwf_dir, d, "wave")
+                    conn_upd = get_connection()
+                    try:
+                        _load_ecmwf_day_to_db(
+                            conn_upd, d, wind_path, wave_path, batch_size, dry_run=False
+                        )
+                    finally:
+                        conn_upd.close()
+
+                elif source == SOURCE_HYCOM_CURRENT:
+                    if rtype == "download":
+                        dl_hycom  = hycom_retry_dl.download_day(dt)
+                        dl_status = DL_COMPLETE if dl_hycom else DL_FAILED
+                        conn_upd = get_connection()
+                        try:
+                            update_coverage(
+                                conn_upd, d, SOURCE_HYCOM_CURRENT,
+                                STATUS_PARTIAL, download_status=dl_status,
+                            )
+                            conn_upd.commit()
+                        finally:
+                            conn_upd.close()
+                        if dl_status == DL_FAILED:
+                            logger.warning(f"  [{d}] HYCOM 재다운로드 실패 — 적재 건너뜀")
+                            continue
+
+                    hycom_path = _nc_path_for_hycom(hycom_dir, d)
+                    conn_upd = get_connection()
+                    try:
+                        _load_hycom_day_to_db(
+                            conn_upd, d, hycom_path, batch_size, dry_run=False
+                        )
+                    finally:
+                        conn_upd.close()
+
+                else:
+                    # 예보 소스 재시도는 현재 미지원 (예보는 당일 발행분만 유효)
+                    logger.debug(f"  [{d}] {source}: 예보 소스 재시도 건너뜀 (당일 발행분 아님)")
+
+        logger.info("STEP 5 완료")
 
     logger.success(f"파이프라인 완료 | 모드: {mode} | 기준 날짜: {today}")

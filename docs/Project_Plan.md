@@ -4,7 +4,7 @@
 > **담당자**: 이훈정 책임 (한화오션)
 > **담당 범위**: 환경 데이터 수집 → PostgreSQL(TimescaleDB) 적재 파이프라인
 > **작업 환경**: Windows 11 + WSL2 (Ubuntu) / Python 3.12 / UV / Docker Desktop
-> **최초 작성일**: 2026-03-15 (KST) | **최종 수정일**: 2026-04-05 (KST, Phase 14~15-B 완료 + 재분석 백필 완료)
+> **최초 작성일**: 2026-03-15 (KST) | **최종 수정일**: 2026-04-13 (KST, Phase 17 다운로드/적재 상태 분리 + 자동 재시도 완료)
 
 ---
 
@@ -837,16 +837,17 @@ schtasks /Create /XML "C:\Users\hjlee\llm_for_ship\scheduler\pipeline_task.xml" 
 
 | 섹션 | 내용 |
 |------|------|
-| **① 파이프라인 상태 요약** | 소스별 최신 상태 카드 (complete/failed/missing 등) |
-| **② 데이터 커버리지 달력** | 최근 14일 × 6개 소스 컬럼 — complete=초록, forecast_only=파랑, failed=빨강, missing=회색 |
-| **③ 예보 데이터 현황** | 예보 테이블별 issued_at 최신 시각 + 커버 범위 |
-| **④ DB 적재 현황** | 테이블별 전체 행 수 |
-| **⑤ 최근 파이프라인 로그** | 최근 50줄 실시간 표시 |
+| **① 오늘 실행 요약** | 실행 시작 시각 / 실행 상태 / 예보 커버리지 / 누락 항목 카드 |
+| **② 예보 커버리지 현황** | 예보 테이블별 실제 커버 일수 vs 목표 일수 |
+| **③ 데이터 커버리지 달력** | 미래 10일(예보) + 과거 30일(재분석) × Wind/Wave/Current 3컬럼 |
+| **④ DB 테이블 현황** | 테이블별 전체 행 수 + 날짜 범위 |
+| **⑤ 최근 로그** | 날짜 선택 / 레벨 필터 / 줄 수 슬라이더 + 로그만 부분 새로고침 버튼 |
 
 **커버리지 달력 컬럼 설계:**
-- `SOURCE_SPLIT`: `ecmwf_reanalysis` → `Wind 재분석` + `Wave 재분석` (1개 소스 → 2개 컬럼)
-- 컬럼 순서: `Wind 재분석 / Wave 재분석 / Current 재분석 / Wind 예보 / Wave 예보 / Current 예보`
-- 데이터 없는 컬럼도 항상 표시 (base 14일 × 6컬럼 프리셋 후 merge)
+- 컬럼: `Wind / Wave / Current` (재분석 + 예보 통합 표시)
+- 재분석 완료 셀: `✅ HH:MM` (KST 기준 적재 완료 시각 표시)
+- 재분석 + 예보 공존: `✅ HH:MM/🔵`
+- 미래 날짜(예보만): `🔵`
 
 **실행 방법:**
 ```bash
@@ -890,6 +891,112 @@ env_ecmwf_forecast:  23,405,793행  (2026-04-05 issued, 10일 예보, 해양 필
 env_hycom_forecast:  85,020,000행  (2026-04-05 issued, 5일 예보)
 env_noaa_forecast:   17,127,120행  (2026-04-05 issued, 5일 예보)
 ```
+
+---
+
+### ✅ 완료된 작업 (Phase 16, 2026-04-12)
+
+#### Phase 16: 모니터링 대시보드 개선 ✅
+
+**배경:**
+- 파이프라인 실행 중 에러 로그가 있으면 무조건 "오류"로 표시 → 실제 진행 상황 파악 불가
+- 로그 새로고침 시 전체 페이지 재로드 → 불편
+- 커버리지 달력에 적재 완료 시각 미표시
+
+**변경 내용 (`monitoring/app.py`):**
+
+**① 실행 상태 판정 로직 전면 개선 (`get_last_run_info()`)**
+- 기존: 오늘 로그 전체에 ERROR가 하나라도 있으면 "오류" 표시 (이전 실행 에러도 포함)
+- 변경: 마지막 파이프라인 시작 이후 로그만 검사 → 에러 여부가 아닌 **진행 여부**로 판정
+
+| 상태 | 표시 | 판정 기준 |
+|------|------|----------|
+| `success` | ✅ 완료 | "파이프라인 완료" 로그 존재 |
+| `running` | 🔄 적재 중 | 미완료 + 마지막 로그 15분 이내 |
+| `stuck` | 🛑 응답 없음 | 미완료 + 마지막 로그 15분 초과 |
+| `no_run` | 📭 실행 없음 | 오늘 시작 로그 없음 |
+| `no_log` | 📭 로그 없음 | 로그 파일 없음 |
+
+- `running` / `stuck` 상태 시: 마지막 로그 메시지 + 경과 시간 박스로 표시
+- `STUCK_THRESHOLD_MIN = 15` (파일 상단에서 조정 가능)
+  - 근거: wave UPDATE 최대 소요 12분 → 15분 임계값으로 오탐 방지
+
+**② 로그 섹션 부분 새로고침 (`@st.fragment`)**
+- `_render_log_section()` 함수를 `@st.fragment`로 분리
+- 섹션 우측 🔄 버튼 클릭 시 로그 섹션만 재실행 (전체 페이지 재로드 없음)
+- `st.rerun(scope="fragment")` 사용 (Streamlit 1.33+ 기능)
+
+**③ 커버리지 달력 적재 완료 시각 표시**
+- `get_coverage()`: `loaded_at` 컬럼 추가 조회
+- `pipeline_coverage.loaded_at` (UTC) → KST 변환 후 `HH:MM` 형식으로 셀에 표시
+- 예: `✅ 10:23` / `✅ 10:23/🔵` (재분석+예보 공존 시)
+- 예보(🔵)·누락(❌) 셀은 시각 미표시
+
+---
+
+### ✅ 완료된 작업 (Phase 17, 2026-04-13)
+
+#### Phase 17: 다운로드/적재 상태 분리 + 자동 재시도 (STEP 5) ✅
+
+**배경 및 문제:**
+- 기존 `pipeline_coverage.status` 컬럼은 다운로드 실패와 적재 실패를 구분 불가
+  - 다운로드 실패인데 적재를 재시도 → 파일 없음으로 실패 반복
+  - 적재 실패인데 다운로드를 재시도 → 불필요한 CDS API/OPeNDAP 요청 낭비
+- 4월 3-5일 ECMWF wave 적재 실패: TimescaleDB 압축 청크에 UPDATE 시도 → `tuple decompression limit exceeded` 에러
+- STEP 1~4 실행 후 누락된 항목을 자동으로 재시도하는 로직 부재
+
+**Stage 1 — `db/schema.py`: 컬럼 추가 마이그레이션**
+- `pipeline_coverage` 테이블에 두 컬럼 추가 (멱등 마이그레이션):
+  - `download_status`: `complete` / `failed` / `skipped` / `NULL`(미시도)
+  - `load_status`: `complete` / `partial` / `failed` / `skipped` / `NULL`(미시도)
+- `migrate_coverage_v2()` 함수 신규 — `ADD COLUMN IF NOT EXISTS` 방식으로 멱등성 보장
+- `initialize_schema()` 16단계로 자동 호출
+
+**Stage 2 — `db/coverage.py`: 함수 확장**
+- `update_coverage()`: `download_status` / `load_status` 파라미터 추가 (하위 호환 유지)
+- `get_retry_targets()` 신규: STEP 5 재시도 대상 분류 함수
+  - `'download'` → `download_status IS NULL or failed` : 다운로드부터 재시도
+  - `'load_only'` → `download_status=complete AND load_status IN (NULL, partial, failed)` : 적재만 재시도
+  - 레거시 레코드(두 컬럼 NULL) → `status` 기반으로 `'download'` 분류
+
+**Stage 3 — `db/loader.py`: TimescaleDB 압축 청크 자동 해제**
+- `_decompress_chunks_for_update()` 신규 — Strategy B wave UPDATE 직전 호출
+- `timescaledb_information.chunks` 뷰에서 대상 날짜·테이블의 압축 청크 조회
+- **별도 autocommit 연결**로 `decompress_chunk()` 실행 (DDL이므로 트랜잭션 롤백 불가)
+- `if_compressed => TRUE` 옵션으로 이미 해제된 청크 재시도 시 에러 방지 (멱등성)
+- 해제된 청크는 TimescaleDB 자동 압축 정책에 의해 주기적으로 재압축됨
+
+**Stage 4 — `pipeline.py`: 단계별 상태 기록**
+- ECMWF ERA5 다운로드 루프: `download_day()` 반환값(Path/None)으로 `download_status` 기록
+- HYCOM 분석 다운로드 루프: 동일
+- `_load_ecmwf_day_to_db()`: 적재 결과에 따라 `load_status` 기록
+- `_load_hycom_day_to_db()`: 적재 결과에 따라 `load_status` 기록 (파일 없음 시 `LOAD_SKIPPED`)
+- 예보 파이프라인: 파일 없음 → `DL_FAILED + LOAD_SKIPPED`, 파일 있음 → `DL_COMPLETE + LOAD_*`
+
+**Stage 5 — `pipeline.py`: STEP 5 자동 재시도 패스**
+- 위치: 예보 파이프라인 완료 직후 (재분석·예보 모두 처리 후)
+- `get_retry_targets()` 호출 → 재시도 대상 분류
+- `'download'` 타입: 다운로더 재실행 → 파일 획득 → DB 적재
+- `'load_only'` 타입: 로컬 파일 재사용 → DB 적재만 수행
+- 예보 소스는 재시도 제외 (당일 발행분 아닌 경우 재적재 의미 없음)
+- 조건: `need_db=True AND dry_run=False AND mode not in download_only/forecast_download_only`
+
+**Stage 6 — `monitoring/app.py`: 달력 및 재시도 섹션 개선**
+- `get_coverage()`: `download_status`, `load_status` 컬럼 추가 조회
+- 달력 셀 이모지 세분화:
+
+  | 상태 | 이모지 | 조건 |
+  |------|--------|------|
+  | 다운+적재 완료 | `✅ HH:MM` | `dl=complete, ld=complete` |
+  | 적재 부분 | `⚠️` | `dl=complete, ld=partial` |
+  | 다운 완료, 적재 실패 | `📥🔴` | `dl=complete, ld=failed` |
+  | 다운로드 실패 | `🔴` | `dl=failed` |
+  | 건너뜀 | `⏭️` | `dl=skipped` |
+  | 레거시 레코드 | 기존 status 이모지 | `dl=NULL` |
+
+- "🔁 재시도 필요 항목 (STEP 5)" 섹션 신규:
+  - 최근 14일 미완료 항목 테이블 표시
+  - `download` 타입: 빨간 배경 / `load_only` 타입: 노란 배경
 
 ---
 
@@ -980,8 +1087,10 @@ env_noaa_forecast:   17,127,120행  (2026-04-05 issued, 5일 예보)
 - LLM Agent에서 JOIN 시 `floor("3h")` 처리 필요
 
 ### TimescaleDB 압축 정책
-- 30일 이상 청크 자동 압축 → 압축된 청크는 쓰기 불가
-- 과거 데이터 재적재 시 `SELECT decompress_chunk(...)` 필요
+- 30일 이상 청크 자동 압축 → 압축된 청크는 UPDATE/DELETE 불가
+- Phase 17부터 Strategy B(wave UPDATE) 실행 전 `_decompress_chunks_for_update()` 자동 호출
+- `decompress_chunk()` 완료 후 청크는 자동 압축 정책에 의해 주기적으로 재압축됨
+- `decompress_chunk(chunk, if_compressed => TRUE)` : 이미 해제된 청크 재실행 시 에러 없이 건너뜀
 
 ### NOAA WW3 제약사항 (2026-03-16 확인)
 - **공간 범위**: 위도 -77.5° ~ 77.5° (극지방 미포함)
@@ -1049,3 +1158,5 @@ env_noaa_forecast:   17,127,120행  (2026-04-05 issued, 5일 예보)
 | (미커밋) | 2026-04-05 | feat: Phase 14 예보 파이프라인 DB 적재 완료 (PK 재설계·coverage 기록·버그 5종 수정) |
 | (미커밋) | 2026-04-05 | feat: Phase 15-A 스케줄러 설정 + Phase 15-B Streamlit 모니터링 대시보드 |
 | (미커밋) | 2026-04-05 | docs: Project Plan Phase 14~15-C 완료 반영 |
+| (미커밋) | 2026-04-12 | feat: Phase 16 모니터링 대시보드 개선 (실행 상태 판정 개선·로그 부분 새로고침·커버리지 시각 표시) |
+| (미커밋) | 2026-04-13 | feat: Phase 17 다운로드/적재 상태 분리 + TimescaleDB 압축 청크 자동 해제 + STEP 5 자동 재시도 |

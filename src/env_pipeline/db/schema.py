@@ -334,6 +334,31 @@ CREATE INDEX IF NOT EXISTS idx_coverage_status
 
 
 # ─────────────────────────────────────────────────────
+# pipeline_coverage v2 마이그레이션 SQL (Phase 17 신규)
+# ─────────────────────────────────────────────────────
+
+# pipeline_coverage 테이블에 download_status / load_status 컬럼 추가
+# ADD COLUMN IF NOT EXISTS → 이미 있으면 에러 없이 건너뜀 (멱등성 보장)
+#
+# download_status 가능값:
+#   'complete'  : 다운로드 완전 완료 (파일 정상)
+#   'failed'    : 다운로드 실패 (네트워크 오류, 서버 미제공 등)
+#   'skipped'   : 해당 소스 다운로드 불필요 (예: 예보 전용 소스의 재분석)
+#   NULL        : 아직 다운로드 시도 전
+#
+# load_status 가능값:
+#   'complete'  : DB 적재 완전 완료
+#   'partial'   : 일부만 적재 (예: wind 성공 + wave 실패)
+#   'failed'    : 적재 시도 자체가 실패
+#   'skipped'   : 다운로드 실패로 인해 적재 미시도
+#   NULL        : 아직 적재 시도 전
+SQL_MIGRATE_COVERAGE_V2 = """
+ALTER TABLE pipeline_coverage
+    ADD COLUMN IF NOT EXISTS download_status TEXT DEFAULT NULL,
+    ADD COLUMN IF NOT EXISTS load_status     TEXT DEFAULT NULL;
+"""
+
+# ─────────────────────────────────────────────────────
 # 예보 테이블 DROP SQL (Phase 14-B 마이그레이션용)
 # ─────────────────────────────────────────────────────
 
@@ -344,6 +369,38 @@ DROP TABLE IF EXISTS env_ecmwf_forecast CASCADE;
 DROP TABLE IF EXISTS env_hycom_forecast  CASCADE;
 DROP TABLE IF EXISTS env_noaa_forecast   CASCADE;
 """
+
+
+def migrate_coverage_v2() -> None:
+    """
+    pipeline_coverage 테이블에 download_status / load_status 컬럼 추가 (Phase 17 마이그레이션)
+
+    기존 status 컬럼은 '다운로드 완료'와 'DB 적재 완료'를 구분하지 못했음.
+    이 함수는 두 컬럼을 추가하여 단계별 추적을 가능하게 함.
+
+    멱등성: ADD COLUMN IF NOT EXISTS 사용 → 이미 추가된 경우 에러 없이 건너뜀.
+    initialize_schema()에서 자동 호출됨.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        # 컬럼 추가 (이미 있으면 IF NOT EXISTS 덕분에 건너뜀)
+        cursor.execute(SQL_MIGRATE_COVERAGE_V2)
+
+        conn.commit()
+        cursor.close()
+        logger.info(
+            "  pipeline_coverage v2 마이그레이션 완료 "
+            "(download_status / load_status 컬럼 확인)"
+        )
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"pipeline_coverage v2 마이그레이션 실패: {e}")
+        raise
+    finally:
+        conn.close()
 
 
 def reinit_forecast_tables() -> None:
@@ -419,6 +476,7 @@ def initialize_schema() -> None:
      5.  HYCOM 예보 테이블 생성 + Hypertable + 인덱스
      6.  NOAA WW3 파랑 예보 테이블 생성 + Hypertable + 인덱스
      7.  pipeline_coverage 테이블 생성 + 인덱스 (Phase 10 신규)
+     8.  pipeline_coverage v2 마이그레이션 — download_status/load_status 컬럼 추가 (Phase 17)
     """
     logger.info("DB 스키마 초기화 시작...")
 
@@ -494,7 +552,7 @@ def initialize_schema() -> None:
         cursor.execute(SQL_CREATE_COVERAGE_TABLE)
 
         # ── 15단계: pipeline_coverage 인덱스 생성 ──
-        logger.info("  15/15 pipeline_coverage 인덱스 생성 중...")
+        logger.info("  15/16 pipeline_coverage 인덱스 생성 중...")
         cursor.execute(SQL_CREATE_COVERAGE_DATE_INDEX)
         cursor.execute(SQL_CREATE_COVERAGE_STATUS_INDEX)
 
@@ -506,6 +564,11 @@ def initialize_schema() -> None:
             "DB 스키마 초기화 완료! "
             "(데이터 테이블 5개 + pipeline_coverage 메타 테이블 1개)"
         )
+
+        # ── 16단계: pipeline_coverage v2 마이그레이션 ──
+        # 별도 커넥션으로 실행 (위 커밋 후 독립 트랜잭션)
+        logger.info("  16/16 pipeline_coverage v2 마이그레이션 (download/load 상태 분리)...")
+        migrate_coverage_v2()
 
     except Exception as e:
         # 에러 발생 시 변경사항 모두 취소

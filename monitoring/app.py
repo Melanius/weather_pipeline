@@ -34,31 +34,53 @@ FORECAST_EXPECTED_DAYS = {
     "env_noaa_forecast":  {"label": "Wave 예보 (NOAA)",     "days": 5},
 }
 
-# pipeline_coverage source → 표시 컬럼명 매핑
-# ecmwf_reanalysis는 Wind+Wave 통합 소스이므로 두 컬럼으로 분리 표시
-SOURCE_SPLIT = {
-    # source          → 표시할 컬럼명 리스트 (1개 또는 2개)
-    "ecmwf_reanalysis": ["Wind 재분석",    "Wave 재분석"],
-    "hycom_current":    ["Current 재분석"],
-    "ecmwf_forecast":   ["Wind 예보"],
-    "noaa_forecast":    ["Wave 예보"],
-    "hycom_forecast":   ["Current 예보"],
+# pipeline_coverage source → 3개 통합 컬럼명 매핑
+# 재분석/예보 구분 없이 Wind / Wave / Current 3개 컬럼으로 통합
+SOURCE_TO_COL = {
+    "ecmwf_reanalysis": ["Wind",    "Wave"],   # ECMWF는 Wind+Wave 통합 테이블
+    "hycom_current":    ["Current"],
+    "ecmwf_forecast":   ["Wind"],
+    "noaa_forecast":    ["Wave"],
+    "hycom_forecast":   ["Current"],
 }
 
-# 컬럼 표시 순서 (재분석 3개 → 예보 3개)
-COVERAGE_COLUMN_ORDER = [
-    "Wind 재분석", "Wave 재분석", "Current 재분석",
-    "Wind 예보",   "Wave 예보",   "Current 예보",
-]
+# 예보 소스 컬럼 매핑 (미래 날짜 달력용)
+FORECAST_COL_MAP = {
+    "Wind":    "env_ecmwf_forecast",
+    "Wave":    "env_noaa_forecast",
+    "Current": "env_hycom_forecast",
+}
 
-# 상태별 이모지
+# 컬럼 표시 순서
+COVERAGE_COLUMN_ORDER = ["Wind", "Wave", "Current"]
+
+# 상태별 이모지 및 레이블
 STATUS_EMOJI = {
     "complete":           "✅",
     "partial":            "⚠️",
-    "forecast_only":      "🔵",
+    "forecast":           "🔵",
     "permanent_forecast": "🟣",
     "missing":            "❌",
     "failed":             "🔴",
+}
+
+# pipeline_coverage DB에 저장된 구 상태명 → 신 상태명 변환
+STATUS_NORMALIZE = {
+    "forecast_only": "forecast",
+}
+
+# download_status / load_status 조합 → 달력 셀 이모지 (Phase 17)
+# download_status: complete / failed / skipped / None(레거시)
+# load_status    : complete / partial / failed / skipped / None(레거시)
+DL_LOAD_EMOJI = {
+    ("complete", "complete"): "✅",    # 다운+적재 모두 완료
+    ("complete", "partial"):  "⚠️",    # 다운 완료, 적재 부분만
+    ("complete", "failed"):   "📥🔴",  # 다운 완료, 적재 실패
+    ("complete", "skipped"):  "📥⏭️", # 다운 완료, 적재 건너뜀
+    ("complete", None):       "📥",    # 다운 완료, 적재 미시도
+    ("failed",   None):       "🔴",    # 다운 실패
+    ("failed",   "skipped"):  "🔴",    # 다운 실패 → 적재 건너뜀
+    ("skipped",  "skipped"):  "⏭️",   # 둘 다 건너뜀
 }
 
 # 로그 레벨별 배경색 (pandas Styler용)
@@ -185,11 +207,12 @@ def get_forecast_horizon() -> dict:
 
 
 def get_coverage(days: int = 30) -> pd.DataFrame:
-    """pipeline_coverage 최근 N일 조회"""
+    """pipeline_coverage 최근 N일 조회 (Phase 17: download_status / load_status 포함)"""
     start = date.today() - timedelta(days=days - 1)
     return _fetch_df(
         """
-        SELECT date, source, status, row_count
+        SELECT date, source, status, row_count, loaded_at,
+               download_status, load_status
         FROM   pipeline_coverage
         WHERE  date >= %s
         ORDER  BY date DESC, source
@@ -199,18 +222,15 @@ def get_coverage(days: int = 30) -> pd.DataFrame:
 
 
 def get_forecast_dates() -> dict[str, set]:
-    """예보 테이블별 실제 존재하는 날짜 집합 반환 (미래 날짜 달력용)"""
-    mapping = {
-        "Wind 예보":    "env_ecmwf_forecast",
-        "Wave 예보":    "env_noaa_forecast",
-        "Current 예보": "env_hycom_forecast",
-    }
+    """예보 테이블별 실제 존재하는 날짜 집합 반환 (미래 날짜 달력용)
+    반환: {"Wind": {date, ...}, "Wave": {date, ...}, "Current": {date, ...}}
+    """
     result = {}
     conn = _get_conn()
     if conn is None:
-        return {k: set() for k in mapping}
+        return {col: set() for col in FORECAST_COL_MAP}
     try:
-        for col_name, table in mapping.items():
+        for col_name, table in FORECAST_COL_MAP.items():
             cur = conn.cursor()
             # 오늘 이후 날짜만 조회 (미래 행만 필요)
             cur.execute(
@@ -272,42 +292,87 @@ def parse_log_file(log_path: Path, n_lines: int = 150) -> list[dict]:
     return parsed
 
 
+STUCK_THRESHOLD_MIN = 15   # 마지막 로그로부터 N분 이상 경과 시 '응답 없음' 판정
+
+
 def get_last_run_info() -> dict:
-    """오늘 로그 파일에서 마지막 파이프라인 실행 정보 추출"""
+    """오늘 로그 파일에서 마지막 파이프라인 실행 정보 추출.
+
+    반환 키:
+        status        : success | running | stuck | dry_run | no_run | no_log
+        time          : 실행 시작 시각 문자열
+        mode          : 실행 모드
+        last_log_time : 마지막 로그 시각 문자열
+        last_log_msg  : 마지막 로그 메시지 (running/stuck 상태 설명용)
+        last_log_age  : 마지막 로그로부터 경과 분 (int)
+    """
+    _empty = {
+        "status": "no_log", "time": "-", "mode": "-",
+        "last_log_time": "-", "last_log_msg": "-", "last_log_age": 0,
+    }
+
     today_str = date.today().strftime("%Y-%m-%d")
     log_path = LOG_DIR / f"pipeline_{today_str}.log"
-
     if not log_path.exists():
-        return {"status": "no_log", "time": "-", "mode": "-", "dry_run": False}
+        return _empty
 
     content = log_path.read_text(encoding="utf-8", errors="ignore")
 
+    # 오늘 로그에서 마지막 파이프라인 시작 위치 탐색
     starts = list(re.finditer(
         r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?"
         r"파이프라인 시작 \| 모드: (\S+) \| dry_run: (\S+)",
         content,
     ))
-    completes = list(re.finditer(r"파이프라인 완료", content))
-    has_error = bool(re.search(r"\| ERROR\s*\|", content))
-
     if not starts:
-        return {"status": "no_run", "time": "-", "mode": "-", "dry_run": False}
+        return {**_empty, "status": "no_run"}
 
-    last = starts[-1]
-    run_time = last.group(1)
-    mode = last.group(2)
-    dry_run = last.group(3) == "True"
+    last_start = starts[-1]
+    run_time = last_start.group(1)
+    mode     = last_start.group(2)
+    dry_run  = last_start.group(3) == "True"
 
+    # 마지막 시작 이후 로그만 검사
+    after_start = content[last_start.start():]
+
+    # 완료 여부
+    completed = bool(re.search(r"파이프라인 완료", after_start))
+
+    # 마지막 로그 줄 파싱 (타임스탬프 + 메시지)
+    last_log_time = "-"
+    last_log_msg  = "-"
+    last_log_age  = 0
+    for line in reversed(after_start.splitlines()):
+        m = _LOG_RE.match(line)
+        if m:
+            last_log_time = m.group(1)
+            last_log_msg  = m.group(3).strip()
+            # 경과 시간 계산
+            try:
+                log_dt = datetime.strptime(last_log_time, "%Y-%m-%d %H:%M:%S")
+                last_log_age = int((datetime.now() - log_dt).total_seconds() / 60)
+            except ValueError:
+                pass
+            break
+
+    # 상태 판정
     if dry_run:
         status = "dry_run"
-    elif completes:
+    elif completed:
         status = "success"
-    elif has_error:
-        status = "error"
+    elif last_log_age >= STUCK_THRESHOLD_MIN:
+        status = "stuck"
     else:
         status = "running"
 
-    return {"status": status, "time": run_time, "mode": mode, "dry_run": dry_run}
+    return {
+        "status":        status,
+        "time":          run_time,
+        "mode":          mode,
+        "last_log_time": last_log_time,
+        "last_log_msg":  last_log_msg,
+        "last_log_age":  last_log_age,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -315,10 +380,20 @@ def get_last_run_info() -> dict:
 # ─────────────────────────────────────────────
 
 def style_coverage_pivot(pivot: pd.DataFrame) -> pd.DataFrame:
-    """커버리지 피벗 테이블: 상태값 → 이모지로 변환"""
-    return pivot.map(
-        lambda v: STATUS_EMOJI.get(str(v), str(v)) if pd.notna(v) and str(v) != "—" else "—"
-    )
+    """커버리지 피벗 테이블: 상태값 → 이모지로 변환
+    - 단일 상태값: STATUS_EMOJI 딕셔너리로 변환
+    - 병기값(예: "✅/🔵"): 이미 이모지이므로 그대로 반환
+    - "—": 그대로 반환
+    """
+    def _convert(v):
+        if pd.isna(v) or str(v) == "—":
+            return "—"
+        s = str(v)
+        # "/" 포함 시 이미 병기 이모지 → 그대로 반환
+        if "/" in s:
+            return s
+        return STATUS_EMOJI.get(s, s)
+    return pivot.map(_convert)
 
 
 def color_log_rows(df: pd.DataFrame):
@@ -327,6 +402,62 @@ def color_log_rows(df: pd.DataFrame):
         color = LOG_LEVEL_COLORS.get(row["레벨"], "#ffffff")
         return [f"background-color: {color}"] * len(row)
     return df.style.apply(_row_color, axis=1)
+
+
+# ─────────────────────────────────────────────
+# 로그 섹션 (fragment — 로그만 부분 새로고침 가능)
+# ─────────────────────────────────────────────
+
+@st.fragment
+def _render_log_section():
+    """최근 로그 섹션. 버튼 클릭 시 전체 페이지 재실행 없이 이 섹션만 재실행."""
+    col_title, col_refresh = st.columns([9, 1])
+    with col_title:
+        st.subheader("📋 최근 로그")
+    with col_refresh:
+        st.write("")   # 버튼 수직 정렬을 위한 여백
+        if st.button("🔄", help="로그만 새로고침"):
+            st.rerun(scope="fragment")
+
+    log_files = sorted(LOG_DIR.glob("pipeline_*.log"), reverse=True)[:5]
+    log_options = {f.stem.replace("pipeline_", ""): f for f in log_files}
+
+    if log_options:
+        col_sel, col_level, col_n = st.columns([2, 2, 2])
+        with col_sel:
+            selected_date = st.selectbox("날짜 선택", options=list(log_options.keys()))
+        with col_level:
+            level_filter = st.multiselect(
+                "레벨 필터",
+                options=["SUCCESS", "ERROR", "WARNING", "INFO", "DEBUG"],
+                default=["SUCCESS", "ERROR", "WARNING", "INFO"],
+            )
+        with col_n:
+            n_lines = st.slider("표시 줄 수", min_value=20, max_value=200, value=50, step=10)
+
+        log_entries = parse_log_file(log_options[selected_date], n_lines=n_lines * 3)
+
+        if log_entries:
+            log_df = pd.DataFrame(log_entries)
+            if level_filter:
+                log_df = log_df[log_df["레벨"].isin(level_filter)]
+            log_df = log_df.tail(n_lines)
+
+            if not log_df.empty:
+                st.dataframe(
+                    color_log_rows(log_df),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=400,
+                )
+            else:
+                st.info("선택한 레벨의 로그가 없습니다.")
+        else:
+            st.info("로그 항목이 없습니다.")
+    else:
+        st.info("로그 파일이 없습니다.")
+
+    st.caption(f"마지막 로드: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 # ─────────────────────────────────────────────
@@ -376,20 +507,21 @@ def main():
     forecast_ok = all(v["ok"] for v in forecast_info.values()) if forecast_info else False
 
     STATUS_DISPLAY = {
-        "success":  "✅ 성공",
+        "success":  "✅ 완료",
         "dry_run":  "🔍 dry-run",
-        "running":  "🔄 실행 중",
-        "error":    "❌ 오류",
+        "running":  "🔄 적재 중",
+        "stuck":    "🛑 응답 없음",
         "no_log":   "📭 로그 없음",
         "no_run":   "📭 실행 없음",
     }
-    status_label = STATUS_DISPLAY.get(run_info["status"], "알 수 없음")
+    status = run_info["status"]
+    status_label = STATUS_DISPLAY.get(status, "알 수 없음")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("마지막 실행", run_info["time"], delta=f"모드: {run_info['mode']}")
+        st.metric("실행 시작", run_info["time"], delta=f"모드: {run_info['mode']}")
     with c2:
-        st.metric("실행 결과", status_label)
+        st.metric("실행 상태", status_label)
     with c3:
         st.metric(
             "예보 커버리지",
@@ -403,6 +535,24 @@ def main():
             f"{missing_cnt}건",
             delta_color="inverse" if missing_cnt > 0 else "normal",
         )
+
+    # running / stuck 상태: 마지막 로그 메시지 + 경과 시간 표시
+    if status in ("running", "stuck"):
+        msg = run_info["last_log_msg"]
+        age = run_info["last_log_age"]
+        age_str = f"{age}분 전" if age > 0 else "방금"
+        last_msg_short = msg[:80] + "…" if len(msg) > 80 else msg
+
+        if status == "stuck":
+            st.warning(
+                f"🛑 **마지막 응답: {age_str}** ({run_info['last_log_time']})\n\n"
+                f"마지막 로그: `{last_msg_short}`"
+            )
+        else:
+            st.info(
+                f"🔄 **진행 중 — 마지막 응답: {age_str}** ({run_info['last_log_time']})\n\n"
+                f"진행 상황: `{last_msg_short}`"
+            )
 
     st.divider()
 
@@ -453,77 +603,107 @@ def main():
 
     cov_df = get_coverage(days=st.session_state.cov_days)
 
-    # 날짜 범위: 과거 N일 + 미래 10일 (ECMWF 예보 최대 10일)
     today = date.today()
-    future_days = 10   # ECMWF 최대 예보 기간
+    future_days  = 10  # ECMWF 최대 예보 기간
     past_dates   = [today - timedelta(days=i) for i in range(st.session_state.cov_days)]
     future_dates = [today + timedelta(days=i) for i in range(1, future_days + 1)]
-    all_dates = future_dates[::-1] + past_dates   # 미래(위) → 과거(아래) 순
 
-    # ── 과거 날짜: pipeline_coverage 데이터 반영 ──
-    expanded_rows = []
+    # ── 과거 날짜: pipeline_coverage → {(date, col): dict} ──
+    # dict 키: status, time_kst, download_status, load_status
+    reanalysis_status: dict[tuple, dict] = {}
     if not cov_df.empty:
         for _, row in cov_df.iterrows():
-            col_names = SOURCE_SPLIT.get(row["source"], [row["source"]])
-            for col_name in col_names:
-                expanded_rows.append({
-                    "date":   row["date"],
-                    "source": col_name,
-                    "status": row["status"],
-                })
+            raw_status = STATUS_NORMALIZE.get(row["status"], row["status"])
 
-    # ── 미래 날짜: 예보 테이블에서 날짜별 존재 여부 조회 ──
-    forecast_dates = get_forecast_dates()
-    REANALYSIS_COLS = {"Wind 재분석", "Wave 재분석", "Current 재분석"}
-    for future_d in future_dates:
-        for col in COVERAGE_COLUMN_ORDER:
-            if col in REANALYSIS_COLS:
-                # 재분석은 미래 데이터 없음 → 빈 칸으로 표시
-                expanded_rows.append({"date": future_d, "source": col, "status": "—"})
+            # loaded_at → KST 시각 문자열
+            loaded_at = row.get("loaded_at")
+            if loaded_at is not None and not pd.isnull(loaded_at):
+                try:
+                    if hasattr(loaded_at, "tzinfo") and loaded_at.tzinfo:
+                        kst = loaded_at.astimezone(timezone(timedelta(hours=9)))
+                    else:
+                        kst = loaded_at + timedelta(hours=9)
+                    time_kst = kst.strftime("%H:%M")
+                except Exception:
+                    time_kst = None
             else:
-                # 예보 테이블에 해당 날짜 데이터 있으면 forecast_only, 없으면 missing
-                status = "forecast_only" if future_d in forecast_dates.get(col, set()) else "missing"
-                expanded_rows.append({"date": future_d, "source": col, "status": status})
+                time_kst = None
 
-    # 전체 날짜 × 6컬럼 베이스 (과거는 missing, 미래는 위에서 채움)
-    base_rows = [
-        {"date": d, "source": col, "status": "missing"}
-        for d in past_dates
-        for col in COVERAGE_COLUMN_ORDER
-    ]
-    base_df = pd.DataFrame(base_rows)
+            # download_status / load_status (Phase 17: None이면 레거시 레코드)
+            dl_st = row.get("download_status") if "download_status" in row.index else None
+            ld_st = row.get("load_status")     if "load_status"     in row.index else None
 
-    if expanded_rows:
-        actual_df = pd.DataFrame(expanded_rows)
-        base_df = base_df.merge(
-            actual_df.rename(columns={"status": "actual_status"}),
-            on=["date", "source"],
-            how="left",
-        )
-        base_df["status"] = base_df["actual_status"].combine_first(base_df["status"])
-        base_df = base_df[["date", "source", "status"]]
+            for col_name in SOURCE_TO_COL.get(row["source"], []):
+                reanalysis_status[(row["date"], col_name)] = {
+                    "status":          raw_status,
+                    "time_kst":        time_kst,
+                    "download_status": dl_st,
+                    "load_status":     ld_st,
+                }
 
-    # 미래 날짜 행 추가
-    future_rows = [
-        {"date": d, "source": col,
-         "status": next((r["status"] for r in expanded_rows if r["date"] == d and r["source"] == col), "missing")}
-        for d in future_dates
-        for col in COVERAGE_COLUMN_ORDER
-    ]
-    full_df = pd.concat([pd.DataFrame(future_rows), base_df], ignore_index=True)
+    # ── 미래 날짜: 예보 테이블 날짜 집합 ──
+    forecast_date_sets = get_forecast_dates()  # {"Wind": {date,...}, ...}
+
+    # ── 전체 행 구성 ──
+    all_rows = []
+
+    # 미래 날짜: 예보 데이터만 존재
+    for d in future_dates:
+        for col in COVERAGE_COLUMN_ORDER:
+            has_fc = d in forecast_date_sets.get(col, set())
+            all_rows.append({
+                "date":   d,
+                "source": col,
+                "status": STATUS_EMOJI.get("forecast", "🔵") if has_fc else "—",
+            })
+
+    # 과거/오늘 날짜: 재분석 + 예보 동시 존재 시 병기
+    for d in past_dates:
+        for col in COVERAGE_COLUMN_ORDER:
+            ra_entry = reanalysis_status.get((d, col))  # dict 또는 None
+            has_fc   = d in forecast_date_sets.get(col, set())
+
+            if ra_entry:
+                dl_st    = ra_entry["download_status"]
+                ld_st    = ra_entry["load_status"]
+                ra_st    = ra_entry["status"]
+                time_kst = ra_entry["time_kst"]
+
+                # Phase 17: download_status/load_status가 있으면 정밀 이모지 사용
+                if dl_st is not None or ld_st is not None:
+                    dl_key   = dl_st if dl_st else ("complete" if ra_st == "complete" else "failed")
+                    base_emoji = DL_LOAD_EMOJI.get((dl_key, ld_st), STATUS_EMOJI.get(ra_st, ra_st))
+                else:
+                    # 레거시 레코드: 기존 status 이모지
+                    base_emoji = STATUS_EMOJI.get(ra_st, ra_st)
+
+                # 완료 상태에는 KST 시각 병기
+                ra_cell = f"{base_emoji} {time_kst}" if (time_kst and "✅" in base_emoji) else base_emoji
+
+                if has_fc:
+                    # 재분석 + 예보 동시 존재 → 이모지 병기
+                    cell_val = f"{ra_cell}/{STATUS_EMOJI.get('forecast', '🔵')}"
+                else:
+                    cell_val = ra_cell
+            elif has_fc:
+                cell_val = STATUS_EMOJI.get("forecast", "🔵")
+            else:
+                cell_val = STATUS_EMOJI.get("missing", "❌")
+
+            all_rows.append({"date": d, "source": col, "status": cell_val})
+
+    full_df = pd.DataFrame(all_rows)
 
     # 피벗: 날짜(행) × 소스(열), 최신 날짜 상단
     pivot = full_df.pivot_table(
         index="date", columns="source", values="status", aggfunc="first"
     ).sort_index(ascending=False)
-
-    # 컬럼 순서 고정 (항상 6개 컬럼)
     pivot = pivot[COVERAGE_COLUMN_ORDER]
 
-    st.caption(f"🔵 미래 10일(예보) + 과거 {st.session_state.cov_days}일(재분석) 표시 중")
-    st.dataframe(style_coverage_pivot(pivot), use_container_width=True)
+    st.caption(f"미래 {future_days}일(예보) + 과거 {st.session_state.cov_days}일(재분석) 표시 중  |  완료 시각은 KST 기준")
+    st.dataframe(pivot, use_container_width=True)
 
-    # 더 보기 버튼 (30일씩 추가)
+    # 더 보기 / 초기화 버튼
     col_more, col_reset, _ = st.columns([1, 1, 8])
     with col_more:
         if st.button("📂 30일 더 보기"):
@@ -534,11 +714,67 @@ def main():
             st.session_state.cov_days = 30
             st.rerun()
 
-    # 범례
-    legend_cols = st.columns(len(STATUS_EMOJI))
-    for i, (status, emoji) in enumerate(STATUS_EMOJI.items()):
+    # 범례 (Phase 17: 다운로드/적재 분리 상태 이모지 추가)
+    ALL_LEGEND = {
+        **STATUS_EMOJI,
+        "다운O/적재X": "📥🔴",
+        "다운O/적재부분": "📥⚠️",
+        "건너뜀": "⏭️",
+    }
+    legend_cols = st.columns(len(ALL_LEGEND))
+    for i, (lbl, emoji) in enumerate(ALL_LEGEND.items()):
         with legend_cols[i]:
-            st.caption(f"{emoji} {status}")
+            st.caption(f"{emoji} {lbl}")
+
+    st.divider()
+
+    # ── 섹션 3-B: STEP 5 재시도 필요 항목 ────────────────
+    st.subheader("🔁 재시도 필요 항목 (STEP 5)")
+
+    retry_df = _fetch_df("""
+        SELECT date, source, status, download_status, load_status, loaded_at, notes
+        FROM   pipeline_coverage
+        WHERE  date >= %s
+          AND  status NOT IN ('complete', 'permanent_forecast')
+          AND  COALESCE(download_status, '') != 'skipped'
+          AND  COALESCE(load_status, '')     != 'skipped'
+        ORDER BY date DESC, source
+    """, (date.today() - timedelta(days=14),))
+
+    if retry_df is not None and not retry_df.empty:
+        # retry_type 열 추가 (download / load_only)
+        def _retry_type(row):
+            if row.get("download_status") == "complete":
+                return "load_only"
+            return "download"
+        retry_df["재시도 유형"] = retry_df.apply(_retry_type, axis=1)
+
+        # 표시 컬럼 정리
+        display_cols = ["date", "source", "status", "download_status", "load_status", "재시도 유형"]
+        display_df   = retry_df[display_cols].rename(columns={
+            "date":            "날짜",
+            "source":          "소스",
+            "status":          "전체 상태",
+            "download_status": "다운로드",
+            "load_status":     "적재",
+        })
+
+        def _highlight_retry(row):
+            if row["재시도 유형"] == "download":
+                return ["background-color: #f8d7da"] * len(row)   # 빨간 배경 (다운 필요)
+            return ["background-color: #fff3cd"] * len(row)       # 노란 배경 (적재만 필요)
+
+        st.caption(
+            f"최근 14일 내 미완료 항목 {len(display_df)}건  |  "
+            "🔴 = 다운로드 재시도 필요  🟡 = 적재만 재시도 필요"
+        )
+        st.dataframe(
+            display_df.style.apply(_highlight_retry, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.success("✅ 재시도 필요 항목 없음 (최근 14일)")
 
     st.divider()
 
@@ -564,47 +800,7 @@ def main():
     st.divider()
 
     # ── 섹션 5: 최근 로그 ───────────────────────────
-    st.subheader("📋 최근 로그")
-
-    log_files = sorted(LOG_DIR.glob("pipeline_*.log"), reverse=True)[:5]
-    log_options = {f.stem.replace("pipeline_", ""): f for f in log_files}
-
-    if log_options:
-        col_sel, col_level, col_n = st.columns([2, 2, 2])
-        with col_sel:
-            selected_date = st.selectbox("날짜 선택", options=list(log_options.keys()))
-        with col_level:
-            level_filter = st.multiselect(
-                "레벨 필터",
-                options=["SUCCESS", "ERROR", "WARNING", "INFO", "DEBUG"],
-                default=["SUCCESS", "ERROR", "WARNING", "INFO"],
-            )
-        with col_n:
-            n_lines = st.slider("표시 줄 수", min_value=20, max_value=200, value=50, step=10)
-
-        log_entries = parse_log_file(log_options[selected_date], n_lines=n_lines * 3)
-
-        if log_entries:
-            log_df = pd.DataFrame(log_entries)
-            if level_filter:
-                log_df = log_df[log_df["레벨"].isin(level_filter)]
-            log_df = log_df.tail(n_lines)
-
-            if not log_df.empty:
-                st.dataframe(
-                    color_log_rows(log_df),
-                    use_container_width=True,
-                    hide_index=True,
-                    height=400,
-                )
-            else:
-                st.info("선택한 레벨의 로그가 없습니다.")
-        else:
-            st.info("로그 항목이 없습니다.")
-    else:
-        st.info("로그 파일이 없습니다.")
-
-    st.caption(f"마지막 로드: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    _render_log_section()
 
 
 main()

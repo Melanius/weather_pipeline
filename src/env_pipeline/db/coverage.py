@@ -1,17 +1,19 @@
 """
-파이프라인 상태 추적 모듈 (Phase 10, Phase 14-A 개선)
-======================================================
+파이프라인 상태 추적 모듈 (Phase 10, Phase 14-A, Phase 17 개선)
+================================================================
 
 pipeline_coverage 테이블을 읽고 쓰는 모든 함수를 담당.
 
 역할:
   - 날짜별·소스별 적재 상태 추적 (complete/partial/forecast_only/missing/failed 등)
+  - 다운로드 상태(download_status)와 DB 적재 상태(load_status)를 분리 추적 (Phase 17)
   - 누락 날짜 자동 감지 → 백필 대상 목록 반환
   - 재분석 완료 날짜에 대한 예보 데이터 삭제 (cleanup)
   - HYCOM 롤링 윈도우 초과 날짜 → permanent_forecast 승격
+  - 재시도 대상 조회 (get_retry_targets) — STEP 5 자동 재시도용 (Phase 17)
   - --diagnose 모드에서 현재 상태 표 출력
 
-상태(status) 값 정의:
+status 컬럼 값 정의 (레거시 + 현행):
   'complete'           → DB 적재 완전 완료 (정상)
   'partial'            → 일부만 적재됨 (재시도 대상)
   'forecast_only'      → 재분석 미제공 → 예보로 임시 커버
@@ -19,10 +21,26 @@ pipeline_coverage 테이블을 읽고 쓰는 모든 함수를 담당.
   'missing'            → 어떤 데이터도 없음
   'failed'             → 다운로드/적재 시도 중 오류 발생
 
+download_status 컬럼 값 정의 (Phase 17 신규):
+  'complete' → 다운로드 완전 완료 (파일 정상)
+  'failed'   → 다운로드 실패 (네트워크 오류, 서버 미제공 등)
+  'skipped'  → 해당 소스 다운로드 불필요
+  NULL       → 아직 시도 전 (또는 레거시 레코드)
+
+load_status 컬럼 값 정의 (Phase 17 신규):
+  'complete' → DB 적재 완전 완료
+  'partial'  → 일부만 적재 (예: wind 성공 + wave 실패)
+  'failed'   → 적재 시도 자체가 실패
+  'skipped'  → 다운로드 실패로 인해 적재 미시도
+  NULL       → 아직 시도 전 (또는 레거시 레코드)
+
 Phase 14-A 변경:
   - 완료 판정 기준을 '행 수 >= expected × threshold' 에서 '예외 없음' 으로 변경.
-  - 해양 필터링·HYCOM 격자 수는 날짜·설정에 따라 달라지므로 고정 expected_rows 비교는 부정확.
   - EXPECTED_ROWS 상수 제거. expected_rows 컬럼은 NULL로 유지 (DB 컬럼 자체는 보존).
+
+Phase 17 변경:
+  - update_coverage()에 download_status / load_status 파라미터 추가
+  - get_retry_targets() 신규 추가 — STEP 5 자동 재시도 대상 분류
 """
 
 from __future__ import annotations
@@ -40,12 +58,24 @@ from loguru import logger
 # 상태 상수 (오타 방지용)
 # ─────────────────────────────────────────────────────
 
+# ── status 컬럼 (기존, 전체 상태 요약) ──
 STATUS_COMPLETE            = "complete"           # 적재 완전 완료
 STATUS_PARTIAL             = "partial"            # 부분 적재 (재시도 필요)
 STATUS_FORECAST_ONLY       = "forecast_only"      # 예보로 임시 커버
 STATUS_PERMANENT_FORECAST  = "permanent_forecast" # 예보가 영구 확정 (HYCOM 윈도우 초과)
 STATUS_MISSING             = "missing"            # 데이터 없음
 STATUS_FAILED              = "failed"             # 오류 발생
+
+# ── download_status 컬럼 (Phase 17: 다운로드 단계 상태) ──
+DL_COMPLETE = "complete"   # 파일 다운로드 완료 및 정상 확인
+DL_FAILED   = "failed"     # 다운로드 실패 (네트워크/서버 오류)
+DL_SKIPPED  = "skipped"    # 해당 소스 다운로드 불필요 (예: 예보 소스의 재분석)
+
+# ── load_status 컬럼 (Phase 17: DB 적재 단계 상태) ──
+LOAD_COMPLETE = "complete"  # DB 적재 완전 완료
+LOAD_PARTIAL  = "partial"   # 부분 적재 (예: wind 성공 + wave 실패)
+LOAD_FAILED   = "failed"    # 적재 시도 자체 실패 (연결 오류 등)
+LOAD_SKIPPED  = "skipped"   # 다운로드 실패로 인해 적재 미시도
 
 # ─────────────────────────────────────────────────────
 # 소스 상수
@@ -82,6 +112,8 @@ def update_coverage(
     row_count: int | None = None,
     data_type: str | None = None,
     notes: str | None = None,
+    download_status: str | None = None,
+    load_status: str | None = None,
 ) -> None:
     """
     pipeline_coverage 테이블에 상태를 기록 (INSERT 또는 UPDATE)
@@ -91,30 +123,36 @@ def update_coverage(
 
     Parameters
     ----------
-    conn        : psycopg2 연결 객체
-    target_date : 기록할 날짜
-    source      : 데이터 소스 (SOURCE_* 상수 사용)
-    status      : 상태 문자열 (STATUS_* 상수 사용)
-    row_count   : 실제 적재된 행 수 (None이면 갱신 안 함)
-    data_type   : 'era5' 또는 'era5t' (재분석 품질 구분, None이면 갱신 안 함)
-    notes       : 부가 메모 (예: "HYCOM window expired")
+    conn            : psycopg2 연결 객체
+    target_date     : 기록할 날짜
+    source          : 데이터 소스 (SOURCE_* 상수 사용)
+    status          : 전체 상태 요약 (STATUS_* 상수 사용)
+    row_count       : 실제 적재된 행 수 (None이면 기존 값 유지)
+    data_type       : 'era5' 또는 'era5t' (None이면 기존 값 유지)
+    notes           : 부가 메모 (None이면 기존 값 유지)
+    download_status : 다운로드 단계 상태 (DL_* 상수, None이면 기존 값 유지)
+    load_status     : DB 적재 단계 상태 (LOAD_* 상수, None이면 기존 값 유지)
     """
 
     cursor = conn.cursor()
     # INSERT ON CONFLICT DO UPDATE 방식
-    # 이미 있으면 status, loaded_at 등 갱신
     # expected_rows 는 NULL로 저장 (Phase 14-A: 행 수 비교 판정 제거)
+    # download_status / load_status: COALESCE → None이면 기존 값 유지
     cursor.execute("""
         INSERT INTO pipeline_coverage
-            (date, source, status, data_type, row_count, expected_rows, loaded_at, notes)
+            (date, source, status, data_type, row_count, expected_rows,
+             loaded_at, notes, download_status, load_status)
         VALUES
-            (%s, %s, %s, %s, %s, NULL, NOW() AT TIME ZONE 'UTC', %s)
+            (%s, %s, %s, %s, %s, NULL,
+             NOW() AT TIME ZONE 'UTC', %s, %s, %s)
         ON CONFLICT (date, source) DO UPDATE SET
-            status        = EXCLUDED.status,
-            data_type     = COALESCE(EXCLUDED.data_type, pipeline_coverage.data_type),
-            row_count     = COALESCE(EXCLUDED.row_count, pipeline_coverage.row_count),
-            loaded_at     = EXCLUDED.loaded_at,
-            notes         = COALESCE(EXCLUDED.notes, pipeline_coverage.notes)
+            status          = EXCLUDED.status,
+            data_type       = COALESCE(EXCLUDED.data_type,        pipeline_coverage.data_type),
+            row_count       = COALESCE(EXCLUDED.row_count,        pipeline_coverage.row_count),
+            loaded_at       = EXCLUDED.loaded_at,
+            notes           = COALESCE(EXCLUDED.notes,            pipeline_coverage.notes),
+            download_status = COALESCE(EXCLUDED.download_status,  pipeline_coverage.download_status),
+            load_status     = COALESCE(EXCLUDED.load_status,      pipeline_coverage.load_status)
     """, (
         target_date,
         source,
@@ -122,8 +160,134 @@ def update_coverage(
         data_type,
         row_count,
         notes,
+        download_status,
+        load_status,
     ))
     # 호출자가 conn.commit() 책임 (트랜잭션 제어권 유지)
+
+
+# ─────────────────────────────────────────────────────
+# STEP 5 자동 재시도 대상 조회 (Phase 17 신규)
+# ─────────────────────────────────────────────────────
+
+def get_retry_targets(
+    conn,
+    today: date,
+    lookback_days: int,
+    reanalysis_start_date: date | None = None,
+) -> list[dict]:
+    """
+    자동 재시도(STEP 5)가 필요한 항목 목록 반환
+
+    각 항목에 대해 다운로드부터 다시 해야 하는지('download'),
+    적재만 다시 하면 되는지('load_only')를 분류하여 반환.
+
+    분류 기준:
+    ┌────────────────────────┬───────────────────────────────────────────────┐
+    │ retry_type             │ 조건                                           │
+    ├────────────────────────┼───────────────────────────────────────────────┤
+    │ 'download'             │ download_status IS NULL or 'failed'            │
+    │                        │ → 다운로드부터 다시 시작 (적재도 포함)            │
+    ├────────────────────────┼───────────────────────────────────────────────┤
+    │ 'load_only'            │ download_status = 'complete'                   │
+    │                        │ AND load_status IN (NULL, 'partial', 'failed') │
+    │                        │ → 다운로드 완료, 적재만 재시도                    │
+    └────────────────────────┴───────────────────────────────────────────────┘
+
+    제외 대상:
+      - status IN ('complete', 'permanent_forecast'): 이미 완료
+      - download_status = 'skipped' or load_status = 'skipped': 의도적 건너뜀
+      - 재분석 소스의 경우 lookback 범위 초과 날짜
+
+    레거시 레코드 처리:
+      - download_status IS NULL + load_status IS NULL + status IN ('partial', 'failed', 'missing')
+        → 'download' 타입으로 분류 (다운로드부터 다시 시도)
+
+    Parameters
+    ----------
+    conn                  : psycopg2 연결 객체
+    today                 : 기준 날짜
+    lookback_days         : 재시도 대상으로 볼 최대 과거 범위 (일)
+    reanalysis_start_date : 재분석 수집 최초 시작일 하한선 (None이면 미적용)
+
+    Returns
+    -------
+    list[dict]: 재시도 대상 목록 (날짜순 정렬)
+        각 dict:
+          {
+            'date':             date,
+            'source':           str,        # SOURCE_* 상수 값
+            'retry_type':       str,        # 'download' | 'load_only'
+            'status':           str,        # 현재 status 컬럼 값
+            'download_status':  str|None,   # 현재 download_status 값
+            'load_status':      str|None,   # 현재 load_status 값
+          }
+    """
+    # 조회 범위 하한선 결정
+    rolling_start = today - timedelta(days=lookback_days)
+    range_start = max(rolling_start, reanalysis_start_date) \
+        if reanalysis_start_date else rolling_start
+
+    cursor = conn.cursor()
+
+    # 완료/영구 예보/건너뜀을 제외한 모든 레코드 조회
+    cursor.execute("""
+        SELECT date, source, status, download_status, load_status
+        FROM pipeline_coverage
+        WHERE date >= %s
+          AND date <= %s
+          AND status NOT IN (%s, %s)
+          AND COALESCE(download_status, '') != %s
+          AND COALESCE(load_status, '')     != %s
+        ORDER BY date, source
+    """, (
+        range_start,
+        today,
+        STATUS_COMPLETE,
+        STATUS_PERMANENT_FORECAST,
+        DL_SKIPPED,
+        LOAD_SKIPPED,
+    ))
+    rows = cursor.fetchall()
+
+    retry_targets = []
+    for d, src, st, dl_st, ld_st in rows:
+
+        # 분류 로직
+        if dl_st == DL_COMPLETE:
+            # 다운로드 완료 → 적재 상태 확인
+            if ld_st in (None, LOAD_PARTIAL, LOAD_FAILED):
+                retry_type = "load_only"
+            else:
+                # load_status = 'complete' 이지만 status != 'complete' → 불일치, 건너뜀
+                continue
+        else:
+            # download_status가 NULL 또는 'failed' → 다운로드부터
+            retry_type = "download"
+
+        retry_targets.append({
+            "date":            d,
+            "source":          src,
+            "retry_type":      retry_type,
+            "status":          st,
+            "download_status": dl_st,
+            "load_status":     ld_st,
+        })
+
+    # 소스별 집계 로그
+    from collections import Counter
+    cnt = Counter(f"{t['source']}:{t['retry_type']}" for t in retry_targets)
+    if retry_targets:
+        logger.info(
+            f"STEP 5 재시도 대상: 총 {len(retry_targets)}건 "
+            f"(범위: {range_start} ~ {today})"
+        )
+        for key, n in sorted(cnt.items()):
+            logger.info(f"  {key}: {n}건")
+    else:
+        logger.info("STEP 5 재시도 대상: 없음 (모두 완료 상태)")
+
+    return retry_targets
 
 
 # ─────────────────────────────────────────────────────

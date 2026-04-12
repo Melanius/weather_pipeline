@@ -187,6 +187,69 @@ def _find_latest_reanalysis_wave(fc_wind_path: Path) -> Path | None:
     return wave_files[-1]   # 파일명 날짜순 정렬 → 마지막 = 가장 최근
 
 
+def _decompress_chunks_for_update(cursor, table_name: str, df) -> None:
+    """
+    Strategy B UPDATE 실행 전, 대상 날짜에 해당하는 압축 청크를 자동 해제
+
+    TimescaleDB는 compress_after 기간이 지난 청크를 자동 압축함.
+    압축된 청크는 UPDATE/DELETE 불가 → "tuple decompression limit exceeded" 에러 발생.
+
+    이 함수는 UPDATE 전에 해당 청크를 해제하여 에러를 방지함.
+    이미 압축되지 않은 청크(30일 이내 데이터)는 자동으로 건너뜀.
+    해제된 청크는 다음 압축 정책 실행 시 자동으로 재압축됨 (약 1시간 주기).
+
+    ※ decompress_chunk는 DDL에 해당하므로 트랜잭션 외부에서 실행해야 함.
+       별도 autocommit 연결을 사용하여 현재 트랜잭션에 영향을 주지 않음.
+
+    Parameters
+    ----------
+    cursor     : psycopg2 커서 (압축 청크 목록 조회용으로만 사용)
+    table_name : 대상 테이블명 (예: 'env_ecmwf_reanalysis')
+    df         : 적재할 DataFrame (datetime 컬럼 포함)
+    """
+    if "datetime" not in df.columns:
+        return   # datetime 컬럼이 없으면 처리 불필요
+
+    # 데이터의 시간 범위 계산 (UTC ISO 문자열로 변환)
+    min_dt = str(df["datetime"].min())  # 예: "2026-04-03 00:00:00+00:00"
+    max_dt = str(df["datetime"].max())
+
+    # 해당 시간 범위와 겹치는 압축된 청크 조회
+    # timescaledb_information.chunks 뷰: TimescaleDB 내부 청크 메타데이터
+    cursor.execute("""
+        SELECT c.chunk_schema || '.' || c.chunk_name
+        FROM timescaledb_information.chunks c
+        WHERE c.hypertable_name = %s
+          AND c.is_compressed   = TRUE
+          AND c.range_start     <= %s::TIMESTAMPTZ
+          AND c.range_end       >  %s::TIMESTAMPTZ
+    """, (table_name, max_dt, min_dt))
+    chunks = [row[0] for row in cursor.fetchall()]
+
+    if not chunks:
+        logger.debug(f"  압축 청크 없음 → 해제 불필요 ({table_name})")
+        return
+
+    # 발견된 압축 청크 해제
+    # decompress_chunk는 DDL → 트랜잭션 롤백 시 취소됨 → autocommit 연결 필요
+    logger.info(f"  압축 청크 {len(chunks)}개 해제 시작 ({table_name}, 수 분 소요 가능)")
+    decomp_conn = get_connection()
+    decomp_conn.autocommit = True   # autocommit: DDL이 즉시 커밋됨 (롤백 불가)
+    try:
+        decomp_cur = decomp_conn.cursor()
+        for chunk in chunks:
+            logger.info(f"    decompress_chunk({chunk}) 실행 중...")
+            # if_compressed => TRUE: 이미 해제된 청크이면 에러 없이 건너뜀
+            # (동시 실행, 재시도 등으로 인한 DuplicateObject 방지)
+            decomp_cur.execute(
+                f"SELECT decompress_chunk('{chunk}', if_compressed => TRUE)"
+            )
+            logger.debug(f"    decompress_chunk({chunk}) 완료")
+        logger.info(f"  압축 청크 해제 완료 ({table_name}, {len(chunks)}개)")
+    finally:
+        decomp_conn.close()   # autocommit이므로 close만 해도 됨
+
+
 def _detect_table_config(nc_path: Path) -> tuple[str, list[str], str, list[str] | None]:
     """
     파일명을 보고 어느 테이블에 적재할지, 컬럼, 파일 유형, UPSERT 갱신 컬럼을 자동 판단
@@ -606,6 +669,12 @@ def load_netcdf_to_db(
 
         elif use_update_strategy:
             # ── 전략 B: tmp_load COPY → main 테이블 UPDATE (wave 전용) ────
+            # step 0) UPDATE 전 압축 청크 자동 해제
+            #   TimescaleDB는 30일 이상 지난 청크를 자동 압축함.
+            #   압축 청크에 UPDATE를 시도하면 "tuple decompression limit exceeded" 발생.
+            #   → 대상 날짜의 압축 청크를 해제한 뒤 UPDATE 진행.
+            _decompress_chunks_for_update(cursor, target_table, df)
+
             # step 1) 임시 테이블 생성 (인덱스 없음 → COPY 빠름)
             col_defs = ", ".join(f"{c} {COLUMN_TYPES[c]}" for c in table_columns)
             cursor.execute(f"CREATE TEMP TABLE tmp_load ({col_defs})")
